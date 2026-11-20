@@ -1,0 +1,23 @@
+[package]
+name = "rusty-bot-local"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+bytes = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+libc = { workspace = true }
+ignore = "0.4.33"
+globset = "0.4.20"
+regex = { workspace = true }
+regex-automata = "0.4.18"
+encoding_rs = "0.8.40"
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+rusty-bot-core = { path = "../rusty-bot-core" }

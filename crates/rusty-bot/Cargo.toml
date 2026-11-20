@@ -1,0 +1,16 @@
+[package]
+name = "rusty-bot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusty-bot-core = { path = "../rusty-bot-core" }
+rusty-bot-engine = { path = "../rusty-bot-engine" }
+rusty-bot-local = { path = "../rusty-bot-local" }
+rusty-bot-memory = { path = "../rusty-bot-memory" }
+jsonschema = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

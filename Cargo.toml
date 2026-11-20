@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/rusty-bot", "crates/rusty-bot-memory", "crates/rusty-bot-core", "crates/rusty-bot-local"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+# Keep local builds small; repeated agent validation must not fill the disk.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+futures-util = "0.3"
+jsonschema = { version = "0.26", default-features = false }
+libc = "0.2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+schemars = "1"
+secrecy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
