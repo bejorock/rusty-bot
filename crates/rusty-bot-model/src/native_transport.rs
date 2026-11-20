@@ -4,6 +4,10 @@
 //! sensitive. The echo guard covers the resolved credential and common wire
 //! encodings, not arbitrary secrets or transformed fragments.
 
+#[cfg(test)]
+#[path = "native_transport_tests.rs"]
+mod tests;
+
 use std::sync::Arc;
 
 /// Apply a selected hook to a fresh original body and validate before any transport effect.
@@ -214,6 +218,12 @@ impl NativeTransport {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "native_response_support_tests.rs"]
+mod response_support;
+#[cfg(test)]
+pub(crate) use response_support::test_response;
 
 fn credential_patterns(secret: &str) -> Vec<Vec<u8>> {
     let json = serde_json::to_string(secret).expect("string serialization cannot fail");

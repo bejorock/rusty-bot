@@ -1,5 +1,9 @@
 //! Context loading, system-prompt replay, and provider message mapping.
 
+#[cfg(test)]
+#[path = "prompt_tests.rs"]
+mod tests;
+
 use std::collections::BTreeMap;
 
 use rusty_bot_core::{

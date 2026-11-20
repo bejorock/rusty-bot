@@ -3,6 +3,10 @@
 //! Opaque state is sensitive history, not encrypted data. Applications must
 //! protect stored transcripts. Older binaries cannot read rich messages.
 
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod tests;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ContentPart, Message, ModelError, ToolCall};

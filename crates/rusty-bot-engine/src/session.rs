@@ -5,7 +5,6 @@
 //! `.pi-workflow/contracts/veronica-session-engine-contract.md`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -27,226 +26,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::deferred::DeferredBuffer;
-use crate::interrupt_port::{InvocationInterruptPort, InvocationResult};
 use crate::prompt;
 use crate::registry::{Registry, ResolvedExtensions, ResolvedToolSet};
 use crate::scheduler::TURN_TASK_KIND;
 use crate::tool_task::{self, RecoveryDecision};
 use crate::transaction::{Transaction, TxError};
 
-#[path = "session/interrupt_driver.rs"]
-mod interrupt_driver;
-pub use interrupt_driver::{InterruptDriveOutcome, SdkInterruptDriver};
-
 impl From<TxError> for SessionError {
     fn from(error: TxError) -> Self {
         match error {
             TxError::Storage(error) => SessionError::Storage(error),
             other => SessionError::Internal(other.to_string()),
-        }
-    }
-}
-
-fn ask_user_spec() -> rusty_bot_core::ToolSpec {
-    rusty_bot_core::ToolSpec {
-        name: "ask_user".into(),
-        description: "Ask the user a question".into(),
-        parameters: json!({"type":"object", "properties":{"question":{"type":"string", "minLength":1, "maxLength":4096}}, "required":["question"], "additionalProperties":false}),
-    }
-}
-
-fn valid_question(arguments: &Value) -> bool {
-    jsonschema::validator_for(&ask_user_spec().parameters).is_ok_and(|v| v.is_valid(arguments))
-        && arguments
-            .get("question")
-            .and_then(Value::as_str)
-            .is_some_and(|q| !q.trim().is_empty() && q.len() <= 4096)
-}
-
-impl SdkReviewDriver {
-    pub async fn submit(&mut self, request: SubmitRequest) -> Result<SubmitOutcome, SessionError> {
-        self.0.check_current_review_policy().await?;
-        self.0.submit(request).await
-    }
-
-    pub async fn cancel_accepted_input(&mut self, request_id: &str) -> Result<bool, SessionError> {
-        self.0.cancel_accepted_input(request_id).await
-    }
-
-    pub async fn pending_review(
-        &self,
-    ) -> Result<Option<rusty_bot_core::PendingReview>, SessionError> {
-        self.0.check_current_review_policy().await?;
-        self.0.pending_review().await
-    }
-
-    /// Original submission associated with a pending or accepted review.
-    pub async fn review_request_id(
-        &self,
-        id: &rusty_bot_core::ReviewId,
-    ) -> Result<String, SessionError> {
-        let pending = if let Some(pending) = self.0.pending_review().await? {
-            if &pending.id == id {
-                Some(pending)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let pending = match pending {
-            Some(pending) => pending,
-            None => {
-                let doc = self
-                    .0
-                    .deps
-                    .storage
-                    .get_document(
-                        &crate::review_state::receipt_address(self.0.spec.session_id, id),
-                        rusty_bot_core::DocumentPoint::Current,
-                    )
-                    .await?
-                    .ok_or_else(|| SessionError::InvalidReview("unknown review ID".into()))?;
-                let receipt: crate::review_state::ReceiptRecord = serde_json::from_value(doc.value)
-                    .map_err(|_| SessionError::InvalidState("invalid review receipt".into()))?;
-                if receipt.version != 1
-                    || &receipt.answer.id != id
-                    || &receipt.pending.pending.id != id
-                {
-                    return Err(SessionError::InvalidState("invalid review receipt".into()));
-                }
-                receipt.check_integrity()?;
-                receipt.pending.pending
-            }
-        };
-        self.0.review_task_request_id(pending.task_id).await
-    }
-
-    pub async fn run_until_idle_with_supervisor(
-        &mut self,
-        cancel: CancellationToken,
-        supervisor: Arc<rusty_bot_core::HookJobSupervisor>,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.0.check_current_review_policy().await?;
-        if let Some(pending) = self.0.pending_review().await? {
-            return Ok(ReviewDriveOutcome::Paused(pending));
-        }
-        if self.0.active_review_receipt().await?.is_some() {
-            return Err(SessionError::PendingReview);
-        }
-        self.drive_with_supervisor(cancel, supervisor).await
-    }
-
-    pub async fn admit_review(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-    ) -> Result<(), SessionError> {
-        self.0.check_current_review_policy().await?;
-        self.0.admit_review(answer).await
-    }
-
-    pub async fn admit_review_with_cancel(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-        cancel: CancellationToken,
-    ) -> Result<(), SessionError> {
-        self.0.set_cancel(cancel);
-        self.admit_review(answer).await
-    }
-
-    pub async fn admit_review_with_supervisor(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-        cancel: CancellationToken,
-        supervisor: Arc<rusty_bot_core::HookJobSupervisor>,
-    ) -> Result<(), SessionError> {
-        let active = Arc::new(());
-        self.0.job_scope = Some((Arc::downgrade(&supervisor), Arc::downgrade(&active)));
-        let result = self.admit_review_with_cancel(answer, cancel).await;
-        drop(active);
-        self.0.job_scope = None;
-        result
-    }
-
-    pub async fn continue_review_with_supervisor(
-        &mut self,
-        cancel: CancellationToken,
-        supervisor: Arc<rusty_bot_core::HookJobSupervisor>,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.drive_with_supervisor(cancel, supervisor).await
-    }
-
-    pub async fn resume_review_with_supervisor(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-        cancel: CancellationToken,
-        supervisor: Arc<rusty_bot_core::HookJobSupervisor>,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.admit_review_with_supervisor(answer, cancel.clone(), supervisor.clone())
-            .await?;
-        self.drive_with_supervisor(cancel, supervisor).await
-    }
-
-    async fn drive_with_supervisor(
-        &mut self,
-        cancel: CancellationToken,
-        supervisor: Arc<rusty_bot_core::HookJobSupervisor>,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        let result = self
-            .0
-            .run_until_idle_with_supervisor(cancel, supervisor)
-            .await?;
-        if let Some(pending) = self.0.paused_review.take() {
-            Ok(ReviewDriveOutcome::Paused(pending))
-        } else {
-            Ok(ReviewDriveOutcome::Settled(result))
-        }
-    }
-
-    pub async fn run_until_idle(
-        &mut self,
-        cancel: CancellationToken,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.0.check_current_review_policy().await?;
-        if let Some(pending) = self.0.pending_review().await? {
-            return Ok(ReviewDriveOutcome::Paused(pending));
-        }
-        if self.0.active_review_receipt().await?.is_some() {
-            return Err(SessionError::InvalidState(
-                "accepted review requires identical answer to continue".into(),
-            ));
-        }
-        self.drive(cancel).await
-    }
-
-    /// Admit an answer and continue the original task, never submitting a new prompt.
-    pub async fn resume_review(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.resume_review_with_cancel(answer, CancellationToken::new())
-            .await
-    }
-
-    pub async fn resume_review_with_cancel(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-        cancel: CancellationToken,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        self.admit_review_with_cancel(answer, cancel.clone())
-            .await?;
-        self.drive(cancel).await
-    }
-
-    async fn drive(
-        &mut self,
-        cancel: CancellationToken,
-    ) -> Result<ReviewDriveOutcome, SessionError> {
-        let result = self.0.run_until_idle(cancel).await?;
-        if let Some(pending) = self.0.paused_review.take() {
-            Ok(ReviewDriveOutcome::Paused(pending))
-        } else {
-            Ok(ReviewDriveOutcome::Settled(result))
         }
     }
 }
@@ -320,30 +110,20 @@ struct ToolEffectIdentity {
     _replay: ReplayPolicy,
 }
 
-struct ReviewCandidate {
-    ordinal: usize,
-    call: ToolCall,
-    final_call: ToolCall,
-    allowed: std::collections::BTreeSet<rusty_bot_core::DecisionKind>,
-}
-
 struct PreparedToolEffect {
     identity: ToolEffectIdentity,
     tool: Option<Arc<dyn Tool>>,
     arguments: Value,
     context: ToolContext,
-    // None means an unsupported host; Some holds positional replay answers.
-    interrupt_answers: Option<Vec<Value>>,
 }
 
 impl PreparedToolEffect {
-    async fn execute(mut self) -> (ToolEffectIdentity, InvocationResult) {
-        let port = self
-            .interrupt_answers
-            .map(|answers| Arc::new(InvocationInterruptPort::new(answers)));
-        if let Some(port) = &port {
-            self.context.interrupt_port = Some(port.clone());
-        }
+    async fn execute(
+        self,
+    ) -> (
+        ToolEffectIdentity,
+        Result<ToolOutput, rusty_bot_core::ToolError>,
+    ) {
         let result = match self.tool {
             Some(tool) => tool.execute(self.arguments, &self.context).await,
             None => Ok(ToolOutput::error(
@@ -351,33 +131,23 @@ impl PreparedToolEffect {
                 "unknown_tool",
             )),
         };
-        let result = match port {
-            Some(port) => port.finish(result),
-            None => InvocationResult::Returned(result),
-        };
         (self.identity, result)
     }
 }
 
 enum RoundResult {
     Prepared(PreparedTool),
-    Effect(ToolEffectIdentity, InvocationResult),
+    Effect(
+        ToolEffectIdentity,
+        Result<ToolOutput, rusty_bot_core::ToolError>,
+    ),
     Panicked(ToolEffectIdentity),
 }
 
 impl RoundResult {
-    // Until a pause ledger exists, even a valid candidate must fail closed.
     fn failure(&self) -> Option<SessionError> {
         match self {
             Self::Panicked(_) => Some(SessionError::Internal("tool effect panicked".into())),
-            Self::Effect(_, InvocationResult::Interrupted(_)) => {
-                Some(SessionError::InterruptUnsupported)
-            }
-            Self::Effect(_, InvocationResult::ProtocolViolation) => {
-                Some(SessionError::InterruptProtocol(
-                    "tool did not propagate interrupt or replay diverged".into(),
-                ))
-            }
             _ => None,
         }
     }
@@ -403,11 +173,6 @@ enum PreparedTool {
         call: ToolCall,
         round: u64,
         message: String,
-    },
-    Review {
-        call: ToolCall,
-        final_call: ToolCall,
-        allowed: std::collections::BTreeSet<rusty_bot_core::DecisionKind>,
     },
     AlreadySettled(ToolRunOutcome),
 }
@@ -629,8 +394,6 @@ pub struct SessionSpec {
     pub hook_yield_limit: u32,
     /// The SDK may inspect hook-bearing sessions; execution remains disabled until dispatch is implemented.
     pub allow_hook_snapshot: bool,
-    /// Persist review policy for a future authorized driver; manual execution remains blocked.
-    pub review_enabled: bool,
 }
 
 impl SessionSpec {
@@ -644,7 +407,6 @@ impl SessionSpec {
             hook_descriptors: Vec::new(),
             hook_yield_limit: 8,
             allow_hook_snapshot: false,
-            review_enabled: false,
         }
     }
 
@@ -668,7 +430,6 @@ impl SessionSpec {
                 .collect(),
             hook_yield_limit: 8,
             allow_hook_snapshot: false,
-            review_enabled: false,
         })
     }
 
@@ -747,6 +508,8 @@ pub struct RunOutcome {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ToolRunOutcome {
     pub is_error: bool,
+    /// Execution was cancelled or recovery refused to repeat an uncertain effect.
+    /// This is a terminal outcome, not a resumable tool pause.
     pub interrupted: bool,
 }
 
@@ -762,7 +525,6 @@ pub struct SessionEngine {
     cancel: CancellationToken,
     reporter: Option<Arc<dyn rusty_bot_core::HookReporter>>,
     compactor: Option<Arc<dyn rusty_bot_core::RequestCompactor>>,
-    max_parallel_tools: NonZeroUsize,
     job_policy: rusty_bot_core::HookJobPolicy,
     job_scope: Option<(
         std::sync::Weak<rusty_bot_core::HookJobSupervisor>,
@@ -772,19 +534,6 @@ pub struct SessionEngine {
     pending_thinking: String,
     last_partial_at: Option<i64>,
     engine_attested_task: Option<TaskId>,
-    sdk_review_driver: bool,
-    // Private seam for a future driver that can durably account for pauses.
-    interrupt_effect_driver: bool,
-    paused_review: Option<rusty_bot_core::PendingReview>,
-}
-
-/// Explicitly marked trusted SDK review-driver boundary.
-pub struct SdkReviewDriver(SessionEngine);
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ReviewDriveOutcome {
-    Settled(RunOutcome),
-    Paused(rusty_bot_core::PendingReview),
 }
 
 impl SessionEngine {
@@ -809,7 +558,6 @@ impl SessionEngine {
         }
 
         let existing = deps.storage.get_session(spec.session_id).await?;
-        let reopening = existing.is_some();
         let (config, conversation_id, _hooks_selected) = match existing {
             Some(record) => {
                 // The session's workspace is caller-selected and durable. A
@@ -873,18 +621,6 @@ impl SessionEngine {
                     format!("hooks:v2:{}", deps.registry.version())
                 } else {
                     deps.registry.version().to_owned()
-                };
-                // An enabled marker in the session record prevents a missing policy
-                // document from being mistaken for a historical disabled session.
-                // It also makes older hosts reject the unfamiliar registry envelope.
-                let marked_review = record.registry_version.starts_with("review:v1:");
-                if marked_review != spec.review_enabled {
-                    return Err(SessionError::ReviewConfigMismatch);
-                }
-                let expected_registry = if marked_review {
-                    format!("review:v1:{expected_registry}")
-                } else {
-                    expected_registry
                 };
                 if record.registry_version != expected_registry {
                     return Err(SessionError::RegistryDrift {
@@ -957,17 +693,7 @@ impl SessionEngine {
                     None => ConversationId(deps.storage.mint_id().await?),
                 };
                 let now = deps.clock.now_ms();
-                let workspace = json!({"key": deps.workspace.key().0, "root": deps.workspace.root(), "host_id": deps.workspace.host_id(), "env_id": deps.workspace.execution_env_id()});
-                let policy = crate::review_state::PolicySnapshot::new(
-                    spec.review_enabled,
-                    &spec.config,
-                    &selected,
-                    &deps.registry,
-                    deps.provider.id(),
-                    workspace,
-                    spec.hook_descriptors.clone(),
-                )?;
-                // The conversation, session association, policy and event share one batch.
+                // The conversation, session association and event share one batch.
                 let mut tx = Transaction::new(
                     deps.storage.as_ref(),
                     CommitContext::conversation(spec.session_id, conversation_id),
@@ -1011,11 +737,7 @@ impl SessionEngine {
                         } else {
                             format!("hooks:v2:{}", deps.registry.version())
                         };
-                        if spec.review_enabled {
-                            format!("review:v1:{base}")
-                        } else {
-                            base
-                        }
+                        base
                     },
                     extension_versions: serde_json::to_value(&spec.extension_versions)
                         .map_err(|error| SessionError::Internal(error.to_string()))?,
@@ -1023,14 +745,6 @@ impl SessionEngine {
                     status: "active".into(),
                     created_at_ms: now,
                     updated_at_ms: now,
-                }))?;
-                tx.write(Write::Document(DocumentWrite::PutLatest {
-                    address: crate::review_state::address(
-                        crate::review_state::POLICY,
-                        spec.session_id,
-                    ),
-                    value: serde_json::to_value(policy)
-                        .map_err(|error| SessionError::Internal(error.to_string()))?,
                 }))?;
                 tx.write(Write::Event(SessionEventDraft {
                     kind: event_kind::SESSION_OPENED.into(),
@@ -1050,25 +764,7 @@ impl SessionEngine {
         };
 
         let resolved = deps.registry.resolve(&config.extensions)?;
-        if reopening {
-            if spec.review_enabled && spec.config != config {
-                return Err(SessionError::InvalidConfig(
-                    "review session configuration mismatch".into(),
-                ));
-            }
-            let workspace = json!({"key": deps.workspace.key().0, "root": deps.workspace.root(), "host_id": deps.workspace.host_id(), "env_id": deps.workspace.execution_env_id()});
-            let policy = crate::review_state::PolicySnapshot::new(
-                spec.review_enabled,
-                &config,
-                &resolved,
-                &deps.registry,
-                deps.provider.id(),
-                workspace,
-                spec.hook_descriptors.clone(),
-            )?;
-            crate::review_state::check_policy(deps.storage.as_ref(), spec.session_id, &policy)
-                .await?;
-        }
+
         let tools = deps
             .registry
             .resolve_tool_set(&resolved, &config.tools, &config.model_tools);
@@ -1085,7 +781,6 @@ impl SessionEngine {
             queued,
             cancel: CancellationToken::new(),
             compactor: None,
-            max_parallel_tools: NonZeroUsize::new(4).expect("nonzero"),
             reporter: None,
             job_policy: rusty_bot_core::HookJobPolicy::default(),
             job_scope: None,
@@ -1093,890 +788,7 @@ impl SessionEngine {
             pending_thinking: String::new(),
             last_partial_at: None,
             engine_attested_task: None,
-            sdk_review_driver: false,
-            interrupt_effect_driver: false,
-            paused_review: None,
         })
-    }
-
-    async fn guard_review_host(&self) -> Result<(), SessionError> {
-        if !self.interrupt_effect_driver {
-            crate::interrupt_state::guard_unsupported_host(
-                self.deps.storage.as_ref(),
-                self.spec.session_id,
-            )
-            .await?;
-        }
-        if self.sdk_review_driver {
-            return Ok(());
-        }
-        crate::review_state::guard_manual(
-            self.deps.storage.as_ref(),
-            self.spec.session_id,
-            self.spec.review_enabled,
-        )
-        .await
-    }
-
-    /// Consume the engine into the explicitly designated review driver.
-    /// This is a deliberate trusted-host opt-in, not an authorization or
-    /// cryptographic boundary. Manual hosts must not use this boundary;
-    /// review resumption is available only through this driver.
-    pub fn into_sdk_review_driver(mut self) -> Result<SdkReviewDriver, SessionError> {
-        if !self.spec.review_enabled {
-            return Err(SessionError::ReviewUnsupported);
-        }
-        self.sdk_review_driver = true;
-        Ok(SdkReviewDriver(self))
-    }
-
-    async fn check_current_review_policy(&self) -> Result<(), SessionError> {
-        crate::interrupt_state::guard_unsupported_host(
-            self.deps.storage.as_ref(),
-            self.spec.session_id,
-        )
-        .await?;
-        let expected = crate::review_state::PolicySnapshot::new(
-            self.spec.review_enabled,
-            &self.config,
-            &self.resolved,
-            &self.deps.registry,
-            self.deps.provider.id(),
-            json!({"key": self.deps.workspace.key().0, "root": self.deps.workspace.root(), "host_id": self.deps.workspace.host_id(), "env_id": self.deps.workspace.execution_env_id()}),
-            self.spec.hook_descriptors.clone(),
-        )?;
-        crate::review_state::check_policy(
-            self.deps.storage.as_ref(),
-            self.spec.session_id,
-            &expected,
-        )
-        .await
-    }
-
-    async fn review_task_request_id(&self, task_id: TaskId) -> Result<String, SessionError> {
-        let task = self
-            .deps
-            .storage
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review task".into()))?;
-        let id = submission_id_of(&task.record)
-            .ok_or_else(|| SessionError::InvalidState("missing review submission ID".into()))?;
-        let submission = self
-            .deps
-            .storage
-            .get_submission(id)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review submission".into()))?;
-        submission
-            .record
-            .request_id
-            .ok_or_else(|| SessionError::InvalidState("missing review request ID".into()))
-    }
-
-    async fn pending_review(&self) -> Result<Option<rusty_bot_core::PendingReview>, SessionError> {
-        let Some(doc) = self
-            .deps
-            .storage
-            .get_document(
-                &crate::review_state::address(crate::review_state::PENDING, self.spec.session_id),
-                rusty_bot_core::DocumentPoint::Current,
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let record: crate::review_state::PendingRecord = serde_json::from_value(doc.value)
-            .map_err(|_| SessionError::InvalidState("invalid pending review".into()))?;
-        let p = &record.pending;
-        if record.version != 1
-            || p.id.0.is_empty()
-            || p.session_id != self.spec.session_id
-            || p.conversation_id != self.conversation_id
-            || crate::review_state::fingerprint(
-                &serde_json::to_value(&record.binding)
-                    .map_err(|_| SessionError::InvalidState("invalid review binding".into()))?,
-            )? != record.fingerprint
-        {
-            return Err(SessionError::InvalidState(
-                "invalid pending review binding".into(),
-            ));
-        }
-        let task = self
-            .deps
-            .storage
-            .get_task(p.task_id)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review task".into()))?;
-        if !matches!(&task.record.state, TaskState::Waiting { on, policy: rusty_bot_core::WaitPolicy::Any, .. } if *on == vec![format!("review:{}", p.id.0)])
-            || task
-                .record
-                .memos
-                .get("generation_round")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                != p.round
-        {
-            return Err(SessionError::InvalidState("invalid review task".into()));
-        }
-        let entries =
-            prompt::load_entries(self.deps.storage.as_ref(), self.conversation_id).await?;
-        let assistant = entries
-            .iter()
-            .find(|e| {
-                e.record.id == record.assistant_entry
-                    && e.record.by_task_id == Some(p.task_id)
-                    && e.record.kind == entry_kind::ASSISTANT
-                    && e.record
-                        .data
-                        .get("round")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        == p.round
-            })
-            .ok_or_else(|| SessionError::InvalidState("missing review assistant".into()))?;
-        let calls: Vec<ToolCall> = serde_json::from_value(
-            assistant
-                .record
-                .data
-                .get("tool_calls")
-                .cloned()
-                .ok_or_else(|| SessionError::InvalidState("missing review calls".into()))?,
-        )
-        .map_err(|_| SessionError::InvalidState("invalid review calls".into()))?;
-        let call = calls
-            .get(p.ordinal)
-            .ok_or_else(|| SessionError::InvalidState("invalid review ordinal".into()))?;
-        let policy = self
-            .deps
-            .storage
-            .get_document(
-                &crate::review_state::address(crate::review_state::POLICY, self.spec.session_id),
-                rusty_bot_core::DocumentPoint::Current,
-            )
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review policy".into()))?;
-        self.check_current_review_policy().await?;
-        let tool = if call.name == "ask_user" && self.ask_user_enabled() {
-            crate::review_state::ToolSnapshot {
-                spec: ask_user_spec(),
-                replay: ReplayPolicy::Unsafe,
-                mode: rusty_bot_core::ExecutionMode::Sequential,
-            }
-        } else {
-            let t = self
-                .tools
-                .get(&call.name)
-                .filter(|_| self.tools.model_visible.contains(&call.name))
-                .ok_or_else(|| SessionError::InvalidState("missing reviewed tool".into()))?;
-            crate::review_state::ToolSnapshot {
-                spec: t.spec(),
-                replay: t.replay(),
-                mode: t.execution_mode(),
-            }
-        };
-        let stored_policy: crate::review_state::PolicySnapshot =
-            serde_json::from_value(policy.value)
-                .map_err(|_| SessionError::InvalidState("invalid review policy".into()))?;
-        let action_valid = match &p.action {
-            rusty_bot_core::ReviewAction::Tool { pub_call } => {
-                call.name != "ask_user"
-                    && self.tools.get(&call.name).is_some_and(|tool| {
-                        validate_arguments(&tool, &record.final_arguments).is_ok()
-                    })
-                    && pub_call.id == call.id
-                    && pub_call.name == call.name
-                    && pub_call.arguments == record.final_arguments
-                    && !p.allowed_decisions.is_empty()
-                    && p.allowed_decisions.iter().all(|d| {
-                        matches!(
-                            d,
-                            rusty_bot_core::DecisionKind::Approve
-                                | rusty_bot_core::DecisionKind::Edit
-                                | rusty_bot_core::DecisionKind::Reject
-                        )
-                    })
-            }
-            rusty_bot_core::ReviewAction::Question { question } => {
-                call.name == "ask_user"
-                    && valid_question(&record.final_arguments)
-                    && record
-                        .final_arguments
-                        .get("question")
-                        .and_then(Value::as_str)
-                        == Some(question)
-                    && p.allowed_decisions
-                        == [
-                            rusty_bot_core::DecisionKind::Respond,
-                            rusty_bot_core::DecisionKind::Reject,
-                        ]
-                        .into_iter()
-                        .collect()
-            }
-        };
-        if !action_valid
-            || record.binding.policy != stored_policy
-            || record.binding.tool != tool
-            || validate_round_prefix(&entries, p.task_id, p.round, &calls)? != p.ordinal
-            || call.arguments != record.original_arguments
-            || record.binding.pending != *p
-            || record.binding.assistant_entry != record.assistant_entry
-            || record.binding.original_call != *call
-            || record.binding.final_arguments != record.final_arguments
-            || self
-                .deps
-                .storage
-                .get_operation(p.task_id, &tool_task::idempotency_key(&call.name, &call.id))
-                .await?
-                .is_some()
-        {
-            return Err(SessionError::InvalidState(
-                "invalid pending review state".into(),
-            ));
-        }
-        Ok(Some(record.pending))
-    }
-
-    async fn active_review_receipt(
-        &self,
-    ) -> Result<Option<crate::review_state::ReceiptRecord>, SessionError> {
-        let docs = self
-            .deps
-            .storage
-            .scan_documents(rusty_bot_core::DocumentQuery {
-                kind: Some(crate::review_state::RECEIPT.into()),
-                scope: Some(DocumentScope::Session(self.spec.session_id)),
-                key: None,
-                at: rusty_bot_core::DocumentPoint::Current,
-                limit: usize::MAX,
-            })
-            .await?;
-        if docs.len() >= 1000 {
-            return Err(SessionError::InvalidState(
-                "review receipt scan is incomplete".into(),
-            ));
-        }
-        let mut active = None;
-        for doc in docs {
-            let receipt: crate::review_state::ReceiptRecord = serde_json::from_value(doc.value)
-                .map_err(|_| SessionError::InvalidState("invalid review receipt".into()))?;
-            if receipt.version != 1
-                || receipt.answer.id != receipt.pending.pending.id
-                || doc.address
-                    != crate::review_state::receipt_address(
-                        self.spec.session_id,
-                        &receipt.answer.id,
-                    )
-            {
-                return Err(SessionError::InvalidState("invalid review receipt".into()));
-            }
-            receipt.check_integrity()?;
-            if receipt.disposition == crate::review_state::ReceiptDisposition::AcceptedInProgress {
-                self.validate_active_review_receipt(&receipt).await?;
-                if active.replace(receipt).is_some() {
-                    return Err(SessionError::InvalidState(
-                        "multiple active review receipts".into(),
-                    ));
-                }
-            }
-        }
-        Ok(active)
-    }
-
-    async fn validate_active_review_receipt(
-        &self,
-        receipt: &crate::review_state::ReceiptRecord,
-    ) -> Result<(), SessionError> {
-        use rusty_bot_core::{DecisionKind, ReviewAction, ReviewDecision};
-        receipt.check_integrity()?;
-        let r = &receipt.pending;
-        let p = &r.pending;
-        self.check_current_review_policy().await?;
-        let policy = self
-            .deps
-            .storage
-            .get_document(
-                &crate::review_state::address(crate::review_state::POLICY, self.spec.session_id),
-                rusty_bot_core::DocumentPoint::Current,
-            )
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review policy".into()))?;
-        let policy: crate::review_state::PolicySnapshot = serde_json::from_value(policy.value)
-            .map_err(|_| SessionError::InvalidState("invalid review policy".into()))?;
-        let call = &r.binding.original_call;
-        let valid_decision = match (&p.action, &receipt.answer.decision) {
-            (ReviewAction::Tool { pub_call }, decision)
-                if call.name != "ask_user"
-                    && pub_call.id == call.id
-                    && pub_call.name == call.name
-                    && pub_call.arguments == r.final_arguments =>
-            {
-                let tool = self
-                    .tools
-                    .get(&call.name)
-                    .filter(|_| self.tools.model_visible.contains(&call.name));
-                tool.is_some_and(|tool| {
-                    let snapshot = crate::review_state::ToolSnapshot {
-                        spec: tool.spec(),
-                        replay: tool.replay(),
-                        mode: tool.execution_mode(),
-                    };
-                    snapshot == r.binding.tool
-                        && validate_arguments(&tool, &r.final_arguments).is_ok()
-                        && !p.allowed_decisions.is_empty()
-                        && p.allowed_decisions.iter().all(|d| {
-                            matches!(
-                                d,
-                                DecisionKind::Approve | DecisionKind::Edit | DecisionKind::Reject
-                            )
-                        })
-                        && match decision {
-                            ReviewDecision::Approve => {
-                                p.allowed_decisions.contains(&DecisionKind::Approve)
-                            }
-                            ReviewDecision::Edit { arguments } => {
-                                p.allowed_decisions.contains(&DecisionKind::Edit)
-                                    && validate_arguments(&tool, arguments).is_ok()
-                            }
-                            ReviewDecision::Reject { reason } => {
-                                p.allowed_decisions.contains(&DecisionKind::Reject)
-                                    && reason.len() <= 4096
-                            }
-                            _ => false,
-                        }
-                })
-            }
-            (ReviewAction::Question { question }, decision)
-                if call.name == "ask_user" && self.ask_user_enabled() =>
-            {
-                r.binding.tool
-                    == (crate::review_state::ToolSnapshot {
-                        spec: ask_user_spec(),
-                        replay: ReplayPolicy::Unsafe,
-                        mode: rusty_bot_core::ExecutionMode::Sequential,
-                    })
-                    && valid_question(&r.final_arguments)
-                    && r.final_arguments.get("question").and_then(Value::as_str) == Some(question)
-                    && p.allowed_decisions
-                        == [DecisionKind::Respond, DecisionKind::Reject]
-                            .into_iter()
-                            .collect()
-                    && match decision {
-                        ReviewDecision::Respond { text } => {
-                            !text.trim().is_empty() && text.len() <= 16384
-                        }
-                        ReviewDecision::Reject { reason } => reason.len() <= 4096,
-                        _ => false,
-                    }
-            }
-            _ => false,
-        };
-        let entries =
-            prompt::load_entries(self.deps.storage.as_ref(), self.conversation_id).await?;
-        let assistant = entries
-            .iter()
-            .find(|e| {
-                e.record.id == r.assistant_entry
-                    && e.record.by_task_id == Some(p.task_id)
-                    && e.record.kind == entry_kind::ASSISTANT
-                    && e.record
-                        .data
-                        .get("round")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        == p.round
-            })
-            .ok_or_else(|| {
-                SessionError::InvalidState("missing accepted review assistant".into())
-            })?;
-        let calls: Vec<ToolCall> = serde_json::from_value(
-            assistant
-                .record
-                .data
-                .get("tool_calls")
-                .cloned()
-                .ok_or_else(|| {
-                    SessionError::InvalidState("missing accepted review calls".into())
-                })?,
-        )
-        .map_err(|_| SessionError::InvalidState("invalid accepted review calls".into()))?;
-        let prefix = validate_round_prefix(&entries, p.task_id, p.round, &calls)?;
-        let no_effect = matches!(
-            receipt.answer.decision,
-            ReviewDecision::Reject { .. } | ReviewDecision::Respond { .. }
-        );
-        let result_valid =
-            if no_effect {
-                let expected = receipt.result_output.clone().unwrap_or_else(|| {
-                    match &receipt.answer.decision {
-                        ReviewDecision::Reject { reason } => {
-                            ToolOutput::error(reason.clone(), "review_rejected")
-                        }
-                        ReviewDecision::Respond { text } => ToolOutput::success(text.clone()),
-                        _ => unreachable!(),
-                    }
-                });
-                entries
-                    .iter()
-                    .filter(|e| {
-                        e.record.by_task_id == Some(p.task_id)
-                            && e.record.kind == entry_kind::TOOL_RESULT
-                            && e.record
-                                .data
-                                .get("round")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0)
-                                == p.round
-                    })
-                    .nth(p.ordinal)
-                    .is_some_and(|e| {
-                        e.record.model
-                            == vec![Message::ToolResult {
-                                tool_call_id: call.id.clone(),
-                                tool_name: call.name.clone(),
-                                content: expected.content,
-                                is_error: expected.is_error,
-                                details: expected.details,
-                            }]
-                    })
-            } else {
-                true
-            };
-        if r.version != 1
-            || p.id.0.is_empty()
-            || p.session_id != self.spec.session_id
-            || p.conversation_id != self.conversation_id
-            || r.binding.policy != policy
-            || r.binding.pending != *p
-            || r.binding.assistant_entry != r.assistant_entry
-            || r.original_arguments != call.arguments
-            || r.binding.final_arguments != r.final_arguments
-            || calls.get(p.ordinal) != Some(call)
-            || prefix < p.ordinal
-            || (no_effect
-                && (prefix <= p.ordinal
-                    || self
-                        .deps
-                        .storage
-                        .get_operation(p.task_id, &tool_task::idempotency_key(&call.name, &call.id))
-                        .await?
-                        .is_some()))
-            || crate::review_state::fingerprint(
-                &serde_json::to_value(&r.binding)
-                    .map_err(|_| SessionError::InvalidState("invalid review binding".into()))?,
-            )? != r.fingerprint
-            || !valid_decision
-            || receipt.result_output.is_some() != no_effect
-            || !result_valid
-        {
-            return Err(SessionError::InvalidState(
-                "invalid accepted review binding".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn completed_review_write(
-        &self,
-        task_id: TaskId,
-    ) -> Result<Option<DocumentWrite>, SessionError> {
-        self.review_disposition_write(task_id, crate::review_state::ReceiptDisposition::Completed)
-            .await
-    }
-
-    async fn review_disposition_write(
-        &self,
-        task_id: TaskId,
-        disposition: crate::review_state::ReceiptDisposition,
-    ) -> Result<Option<DocumentWrite>, SessionError> {
-        let Some(mut receipt) = self.active_review_receipt().await? else {
-            return Ok(None);
-        };
-        if receipt.pending.pending.task_id != task_id {
-            return Err(SessionError::InvalidState(
-                "review continuation task mismatch".into(),
-            ));
-        }
-        receipt.disposition = disposition;
-        Ok(Some(DocumentWrite::PutLatest {
-            address: crate::review_state::receipt_address(self.spec.session_id, &receipt.answer.id),
-            value: serde_json::to_value(receipt)
-                .map_err(|_| SessionError::Internal("review serialization failed".into()))?,
-        }))
-    }
-
-    async fn admit_review(
-        &mut self,
-        answer: rusty_bot_core::ReviewAnswer,
-    ) -> Result<(), SessionError> {
-        use rusty_bot_core::{DecisionKind, ReviewAction, ReviewDecision};
-        let address = crate::review_state::receipt_address(self.spec.session_id, &answer.id);
-        if let Some(doc) = self
-            .deps
-            .storage
-            .get_document(&address, rusty_bot_core::DocumentPoint::Current)
-            .await?
-        {
-            let receipt: crate::review_state::ReceiptRecord = serde_json::from_value(doc.value)
-                .map_err(|_| SessionError::InvalidState("invalid review receipt".into()))?;
-            if receipt.version != 1
-                || receipt.answer.id != answer.id
-                || receipt.pending.pending.id != answer.id
-            {
-                return Err(SessionError::InvalidState("invalid review receipt".into()));
-            }
-            receipt.check_integrity()?;
-            if receipt.answer != answer {
-                return Err(SessionError::ReviewConflict);
-            }
-            if receipt.disposition != crate::review_state::ReceiptDisposition::AcceptedInProgress {
-                return Err(SessionError::ReviewAlreadyResolved);
-            }
-            if self.active_review_receipt().await?.as_ref() != Some(&receipt) {
-                return Err(SessionError::InvalidState(
-                    "invalid active review receipt".into(),
-                ));
-            }
-            return Ok(());
-        }
-        let Some(pending) = self.pending_review().await? else {
-            return Err(SessionError::InvalidReview("unknown review ID".into()));
-        };
-        if pending.id != answer.id {
-            return Err(SessionError::InvalidReview("unknown review ID".into()));
-        }
-        if self.active_review_receipt().await?.is_some() {
-            return Err(SessionError::InvalidState(
-                "review continuation already active".into(),
-            ));
-        }
-        let kind = match &answer.decision {
-            ReviewDecision::Approve => DecisionKind::Approve,
-            ReviewDecision::Edit { .. } => DecisionKind::Edit,
-            ReviewDecision::Reject { .. } => DecisionKind::Reject,
-            ReviewDecision::Respond { .. } => DecisionKind::Respond,
-        };
-        if !pending.allowed_decisions.contains(&kind) {
-            return Err(SessionError::InvalidReview("decision not allowed".into()));
-        }
-        match (&pending.action, &answer.decision) {
-            (ReviewAction::Tool { pub_call }, ReviewDecision::Approve) => {
-                let _ = pub_call;
-            }
-            (ReviewAction::Tool { pub_call }, ReviewDecision::Edit { arguments }) => {
-                let tool = self
-                    .tools
-                    .get(&pub_call.name)
-                    .ok_or_else(|| SessionError::InvalidState("missing reviewed tool".into()))?;
-                validate_arguments(&tool, arguments).map_err(SessionError::InvalidReview)?;
-            }
-            (
-                ReviewAction::Tool { .. } | ReviewAction::Question { .. },
-                ReviewDecision::Reject { reason },
-            ) if reason.len() <= 4096 => {}
-            (ReviewAction::Question { .. }, ReviewDecision::Respond { text })
-                if !text.trim().is_empty() && text.len() <= 16384 => {}
-            _ => {
-                return Err(SessionError::InvalidReview(
-                    "invalid decision or text".into(),
-                ))
-            }
-        }
-        let doc = self
-            .deps
-            .storage
-            .get_document(
-                &crate::review_state::address(crate::review_state::PENDING, self.spec.session_id),
-                rusty_bot_core::DocumentPoint::Current,
-            )
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review".into()))?;
-        let record: crate::review_state::PendingRecord = serde_json::from_value(doc.value)
-            .map_err(|_| SessionError::InvalidState("invalid pending review".into()))?;
-        if record.pending != pending {
-            return Err(SessionError::InvalidState("review changed".into()));
-        }
-        let task = self
-            .deps
-            .storage
-            .get_task(pending.task_id)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review task".into()))?;
-        let mut updated = task.record.clone();
-        if !matches!(&updated.state, TaskState::Waiting { on, .. } if *on == vec![format!("review:{}", pending.id.0)])
-        {
-            return Err(SessionError::InvalidState("review task changed".into()));
-        }
-        updated.version += 1;
-        updated.state = TaskState::Running {
-            checkpoint: task.record.state.checkpoint().cloned(),
-            wake: None,
-        };
-        let result_output = match &answer.decision {
-            ReviewDecision::Reject { reason } => {
-                Some(ToolOutput::error(reason.clone(), "review_rejected"))
-            }
-            ReviewDecision::Respond { text } => Some(ToolOutput::success(text.clone())),
-            _ => None,
-        };
-        let mut result_output = result_output;
-        if let Some(output) = &mut result_output {
-            self.hook_dispatcher(self.cancel.clone())
-                .after_tool(pending.task_id, &record.binding.original_call, output)
-                .await?;
-            if let Err(reason) = validate_tool_images(output).await {
-                *output = ToolOutput::error(reason, "invalid_image");
-            }
-        }
-        let result_entry = if let Some(output) = &result_output {
-            let entry_id = EntryId(self.deps.storage.mint_id().await?);
-            let call = &record.binding.original_call;
-            let has_more = self
-                .has_more_calls(pending.task_id, pending.round, &call.id)
-                .await?;
-            updated.state = TaskState::Running {
-                checkpoint: if has_more {
-                    Some(ToolCheckpoint::Call)
-                } else {
-                    None
-                },
-                wake: None,
-            };
-            Some(tool_result_entry(
-                entry_id,
-                self.conversation_id,
-                pending.task_id,
-                call,
-                output,
-                pending.round,
-                false,
-            ))
-        } else {
-            None
-        };
-        let mut receipt = crate::review_state::ReceiptRecord {
-            version: 1,
-            answer: answer.clone(),
-            pending: record,
-            disposition: crate::review_state::ReceiptDisposition::AcceptedInProgress,
-            result_output,
-            integrity: None,
-        };
-        receipt.seal()?;
-        let deferred = self.deferred.drain();
-        let mut tx = self.conversation_tx();
-        if let Some(entry) = result_entry {
-            tx.write(Write::Event(SessionEventDraft {
-                kind: event_kind::ENTRY_COMMITTED.into(),
-                payload: json!({"entry_id": entry.id.0, "kind": entry_kind::TOOL_RESULT}),
-            }))?;
-            tx.write(Write::Entry(entry))?;
-        }
-        tx.write(Write::Task(updated.clone()))?;
-        tx.write(Write::Document(DocumentWrite::PutLatest {
-            address,
-            value: serde_json::to_value(receipt)
-                .map_err(|_| SessionError::Internal("review serialization failed".into()))?,
-        }))?;
-        tx.write(Write::Document(DocumentWrite::Retire {
-            address: crate::review_state::address(
-                crate::review_state::PENDING,
-                self.spec.session_id,
-            ),
-        }))?;
-        tx.write(Write::Event(SessionEventDraft {
-            kind: event_kind::TASK_CHANGED.into(),
-            payload: task_event_payload(&updated),
-        }))?;
-        for write in deferred {
-            tx.write(Write::Document(write))?;
-        }
-        let result = tx.commit().await?;
-        if matches!(
-            result.refused.as_ref().map(|r| &r.reason),
-            Some(rusty_bot_core::RefusalReason::VersionConflict { .. })
-        ) {
-            if let Some(doc) = self
-                .deps
-                .storage
-                .get_document(
-                    &crate::review_state::receipt_address(self.spec.session_id, &answer.id),
-                    rusty_bot_core::DocumentPoint::Current,
-                )
-                .await?
-            {
-                let receipt: crate::review_state::ReceiptRecord = serde_json::from_value(doc.value)
-                    .map_err(|_| SessionError::InvalidState("invalid review receipt".into()))?;
-                if receipt.version != 1
-                    || receipt.answer.id != answer.id
-                    || receipt.pending.pending.id != answer.id
-                {
-                    return Err(SessionError::InvalidState("invalid review receipt".into()));
-                }
-                receipt.check_integrity()?;
-                if receipt.answer != answer {
-                    return Err(SessionError::ReviewConflict);
-                }
-                if receipt.disposition
-                    != crate::review_state::ReceiptDisposition::AcceptedInProgress
-                {
-                    return Err(SessionError::ReviewAlreadyResolved);
-                }
-                if self.active_review_receipt().await?.as_ref() != Some(&receipt) {
-                    return Err(SessionError::InvalidState(
-                        "invalid active review receipt".into(),
-                    ));
-                }
-                return Ok(());
-            }
-            return Err(SessionError::ReviewConflict);
-        }
-        self.handle_task_receipt(result, task.record.version).await
-    }
-
-    async fn commit_review(
-        &mut self,
-        task_id: TaskId,
-        round: u64,
-        assistant_entry: EntryId,
-        calls: &[ToolCall],
-        candidate: ReviewCandidate,
-    ) -> Result<(), SessionError> {
-        let ReviewCandidate {
-            ordinal,
-            call,
-            final_call,
-            allowed,
-        } = candidate;
-        if self.pending_review().await?.is_some() {
-            return Err(SessionError::InvalidState("review already pending".into()));
-        }
-        let entries =
-            prompt::load_entries(self.deps.storage.as_ref(), self.conversation_id).await?;
-        if validate_round_prefix(&entries, task_id, round, calls)? != ordinal
-            || self
-                .deps
-                .storage
-                .get_operation(task_id, &tool_task::idempotency_key(&call.name, &call.id))
-                .await?
-                .is_some()
-        {
-            return Err(SessionError::InvalidState(
-                "invalid review prefix or operation".into(),
-            ));
-        }
-        let task = self
-            .deps
-            .storage
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review task".into()))?;
-        if !matches!(task.record.state, TaskState::Running { .. }) {
-            return Err(SessionError::InvalidState(
-                "review task is not running".into(),
-            ));
-        }
-        self.check_current_review_policy().await?;
-        if self.cancel.is_cancelled() {
-            return Err(SessionError::Cancelled);
-        }
-        let action = if call.name == "ask_user" {
-            rusty_bot_core::ReviewAction::Question {
-                question: final_call.arguments["question"]
-                    .as_str()
-                    .ok_or_else(|| SessionError::InvalidState("invalid question".into()))?
-                    .to_owned(),
-            }
-        } else {
-            rusty_bot_core::ReviewAction::Tool {
-                pub_call: final_call.clone(),
-            }
-        };
-        let pending = rusty_bot_core::PendingReview {
-            id: rusty_bot_core::ReviewId(uuid::Uuid::new_v4().to_string()),
-            session_id: self.spec.session_id,
-            conversation_id: self.conversation_id,
-            task_id,
-            round,
-            ordinal,
-            action,
-            allowed_decisions: allowed,
-        };
-        let policy = self
-            .deps
-            .storage
-            .get_document(
-                &crate::review_state::address(crate::review_state::POLICY, self.spec.session_id),
-                rusty_bot_core::DocumentPoint::Current,
-            )
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing review policy".into()))?;
-        let tool = self.tools.get(&call.name);
-        let tool_binding = tool
-            .map(|t| crate::review_state::ToolSnapshot {
-                spec: t.spec(),
-                replay: t.replay(),
-                mode: t.execution_mode(),
-            })
-            .unwrap_or_else(|| crate::review_state::ToolSnapshot {
-                spec: ask_user_spec(),
-                replay: ReplayPolicy::Unsafe,
-                mode: rusty_bot_core::ExecutionMode::Sequential,
-            });
-        let binding = crate::review_state::ReviewBinding {
-            pending: pending.clone(),
-            assistant_entry,
-            original_call: call.clone(),
-            final_arguments: final_call.arguments.clone(),
-            tool: tool_binding,
-            policy: serde_json::from_value(policy.value)
-                .map_err(|_| SessionError::InvalidState("invalid review policy".into()))?,
-        };
-        let binding_value = serde_json::to_value(&binding)
-            .map_err(|_| SessionError::Internal("review serialization failed".into()))?;
-        let record = crate::review_state::PendingRecord {
-            version: 1,
-            pending: pending.clone(),
-            assistant_entry,
-            original_arguments: call.arguments,
-            final_arguments: final_call.arguments,
-            fingerprint: crate::review_state::fingerprint(&binding_value)?,
-            binding,
-        };
-        let mut updated = task.record.clone();
-        updated.version += 1;
-        updated.state = TaskState::Waiting {
-            checkpoint: task.record.state.checkpoint().cloned(),
-            on: vec![format!("review:{}", pending.id.0)],
-            policy: rusty_bot_core::WaitPolicy::Any,
-        };
-        let completed_review = self.completed_review_write(task_id).await?;
-        let deferred = self.deferred.drain();
-        let mut tx = self.conversation_tx();
-        if let Some(write) = completed_review {
-            tx.write(Write::Document(write))?;
-        }
-        tx.write(Write::Task(updated.clone()))?;
-        tx.write(Write::Document(DocumentWrite::PutLatest {
-            address: crate::review_state::address(
-                crate::review_state::PENDING,
-                self.spec.session_id,
-            ),
-            value: serde_json::to_value(record)
-                .map_err(|_| SessionError::Internal("review serialization failed".into()))?,
-        }))?;
-        tx.write(Write::Event(SessionEventDraft {
-            kind: event_kind::TASK_CHANGED.into(),
-            payload: task_event_payload(&updated),
-        }))?;
-        for write in deferred {
-            tx.write(Write::Document(write))?;
-        }
-        let receipt = tx.commit().await?;
-        self.handle_task_receipt(receipt, task.record.version)
-            .await?;
-        self.paused_review = Some(pending);
-        Ok(())
     }
 
     pub fn conversation_id(&self) -> ConversationId {
@@ -2111,11 +923,6 @@ impl SessionEngine {
     /// token here lets the sandboxed shell kill the child process group when
     /// the step is cancelled; the engine still commits the interrupted outcome
     /// itself, so no external effect is repeated on retry.
-    /// Limit concurrent tool effects in engine-driven rounds (default four).
-    pub fn set_max_parallel_tools(&mut self, max: NonZeroUsize) {
-        self.max_parallel_tools = max;
-    }
-
     pub fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = cancel;
     }
@@ -2151,13 +958,6 @@ impl SessionEngine {
     }
 
     pub async fn submit(&mut self, request: SubmitRequest) -> Result<SubmitOutcome, SessionError> {
-        self.guard_review_host().await?;
-        let pending = if self.sdk_review_driver {
-            self.pending_review().await?
-        } else {
-            None
-        };
-        let accepted = self.sdk_review_driver && self.active_review_receipt().await?.is_some();
         self.ensure_supported_hooks()?;
         let (request_id, kind, payload, content) = match request {
             SubmitRequest::Input { request_id, text } => {
@@ -2187,25 +987,6 @@ impl SessionEngine {
             return Ok(SubmitOutcome::Rejected {
                 reason: RejectReason::InvalidRequest("request_id is required".into()),
             });
-        }
-        // A pending review permits only the exact original submission to be deduplicated.
-        if accepted {
-            return Err(SessionError::PendingReview);
-        }
-        if let Some(pending) = pending {
-            if self.review_task_request_id(pending.task_id).await? != request_id {
-                return Err(SessionError::PendingReview);
-            }
-            let existing = self
-                .deps
-                .storage
-                .find_submission_by_request(self.conversation_id, &request_id)
-                .await?
-                .ok_or_else(|| SessionError::InvalidState("missing review submission".into()))?;
-            return match compare_submission(&existing.record, kind, &payload, request_id)? {
-                duplicate @ SubmitOutcome::Duplicate { .. } => Ok(duplicate),
-                _ => Err(SessionError::PendingReview),
-            };
         }
         // Dedupe happens before any write.
         if let Some(existing) = self
@@ -2298,7 +1079,6 @@ impl SessionEngine {
     /// Returns true only if this call terminalized the submission. A finished
     /// submission is left untouched so completion and errors retain precedence.
     pub async fn cancel_accepted_input(&mut self, request_id: &str) -> Result<bool, SessionError> {
-        self.guard_review_host().await?;
         let Some(stored) = self
             .deps
             .storage
@@ -2429,36 +1209,7 @@ impl SessionEngine {
     }
 
     pub async fn plan_next(&mut self) -> Result<WorkItem, SessionError> {
-        self.guard_review_host().await?;
         self.ensure_supported_hooks()?;
-        // An accepted review owns the session until the original run pauses or
-        // terminalizes. Do not place queued submissions or schedule other tasks.
-        if self.sdk_review_driver {
-            if let Some(receipt) = self.active_review_receipt().await? {
-                let task = self
-                    .deps
-                    .storage
-                    .get_task(receipt.pending.pending.task_id)
-                    .await?
-                    .ok_or_else(|| {
-                        SessionError::InvalidState("missing review continuation task".into())
-                    })?;
-                if task.record.state.is_terminal()
-                    || matches!(
-                        task.record.state,
-                        TaskState::Waiting { .. } | TaskState::Sleeping { .. }
-                    )
-                {
-                    return Err(SessionError::InvalidState(
-                        "invalid review continuation task state".into(),
-                    ));
-                }
-                return match self.task_work(task).await? {
-                    Some(work) => Ok(work),
-                    None => self.plan_review_continuation().await,
-                };
-            }
-        }
         // A settled run with pending observers holds the boundary, including on reopen.
         if self.has_hook(rusty_bot_core::HookPoint::AfterRun) {
             let tasks = self
@@ -2524,18 +1275,6 @@ impl SessionEngine {
         }
         Err(SessionError::InvalidState(
             "plan_next could not reach a stable state".into(),
-        ))
-    }
-
-    async fn plan_review_continuation(&mut self) -> Result<WorkItem, SessionError> {
-        // task_work may finish an observer or a hook-driven termination. If the
-        // receipt was completed in that transition, report idle rather than
-        // scheduling unrelated queued submissions in this drive.
-        if self.active_review_receipt().await?.is_none() {
-            return Ok(WorkItem::Idle);
-        }
-        Err(SessionError::InvalidState(
-            "review continuation did not produce work".into(),
         ))
     }
 
@@ -2787,23 +1526,8 @@ impl SessionEngine {
         }))
     }
 
-    fn ask_user_enabled(&self) -> bool {
-        fn permits(filter: &ToolFilter) -> bool {
-            match filter {
-                ToolFilter::All => true,
-                ToolFilter::Only(names) => names.iter().any(|n| n == "ask_user"),
-                ToolFilter::AddRemove { remove, .. } => !remove.iter().any(|n| n == "ask_user"),
-            }
-        }
-        self.spec.review_enabled && permits(&self.config.tools) && permits(&self.config.model_tools)
-    }
-
     fn model_specs(&self) -> Vec<rusty_bot_core::ToolSpec> {
-        let mut specs = self.tools.model_specs();
-        if self.ask_user_enabled() {
-            specs.push(ask_user_spec());
-        }
-        specs
+        self.tools.model_specs()
     }
 
     async fn build_request(&mut self) -> Result<rusty_bot_core::HistoryRequest, SessionError> {
@@ -2958,7 +1682,6 @@ impl SessionEngine {
         task_id: TaskId,
         turn: rusty_bot_core::AssistantTurn,
     ) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         let turn = rusty_bot_core::history_turn_from_legacy(turn)
             .map_err(|e| SessionError::ContractViolation(e.to_string()))?;
         self.complete_history_generation(task_id, turn).await
@@ -2969,7 +1692,6 @@ impl SessionEngine {
         task_id: TaskId,
         turn: rusty_bot_core::HistoryTurn,
     ) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         if self.engine_attested_task != Some(task_id) {
             let request = self.build_request().await?;
             if crate::native_context::load(
@@ -3014,14 +1736,6 @@ impl SessionEngine {
                 && !self.has_hook(rusty_bot_core::HookPoint::AfterTool)
             {
                 for call in &calls {
-                    if call.name == "ask_user" && self.ask_user_enabled() {
-                        if !valid_question(&call.arguments) {
-                            return Err(SessionError::ContractViolation(
-                                "invalid tool arguments".into(),
-                            ));
-                        }
-                        continue;
-                    }
                     if !self.tools.model_visible.contains(&call.name) {
                         return Err(SessionError::ContractViolation("undeclared tool".into()));
                     }
@@ -3270,7 +1984,6 @@ impl SessionEngine {
         task_id: TaskId,
         error: ModelError,
     ) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         let Some(stored) = self.deps.storage.get_task(task_id).await? else {
             return Err(SessionError::ContractViolation(format!(
                 "unknown task {}",
@@ -3325,18 +2038,10 @@ impl SessionEngine {
             by_task_id: Some(task_id),
         };
 
-        let completed_review = self
-            .review_disposition_write(
-                task_id,
-                crate::review_state::ReceiptDisposition::TerminalFailure,
-            )
-            .await?;
         let deferred = self.deferred.drain();
 
         let mut tx = self.conversation_tx();
-        if let Some(write) = completed_review {
-            tx.write(Write::Document(write))?;
-        }
+
         tx.write(Write::Event(SessionEventDraft {
             kind: event_kind::ENTRY_COMMITTED.into(),
             payload: json!({ "entry_id": entry_id.0, "kind": entry_kind::ERROR }),
@@ -3367,27 +2072,10 @@ impl SessionEngine {
         task_id: TaskId,
         call: ToolCall,
     ) -> Result<ToolRunOutcome, SessionError> {
-        self.guard_review_host().await?;
         match self.prepare_tool_effect(task_id, call).await? {
             PreparedTool::Effect(effect) => {
                 let (identity, result) = effect.execute().await;
-                match result {
-                    InvocationResult::Returned(result) => {
-                        self.settle_tool_effect(&identity, result, false).await
-                    }
-                    InvocationResult::Interrupted(_) => {
-                        self.mark_effect_uncertain(identity.stored.record.id, &identity.key)
-                            .await?;
-                        Err(SessionError::InterruptUnsupported)
-                    }
-                    InvocationResult::ProtocolViolation => {
-                        self.mark_effect_uncertain(identity.stored.record.id, &identity.key)
-                            .await?;
-                        Err(SessionError::InterruptProtocol(
-                            "tool did not propagate interrupt or replay diverged".into(),
-                        ))
-                    }
-                }
+                self.settle_tool_effect(&identity, result, false).await
             }
             prepared => self.settle_prepared_tool(prepared, false).await,
         }
@@ -3403,9 +2091,6 @@ impl SessionEngine {
         match prepared {
             PreparedTool::Effect(_) => Err(SessionError::Internal(
                 "cannot settle an unexecuted tool effect".into(),
-            )),
-            PreparedTool::Review { .. } => Err(SessionError::InvalidState(
-                "review requires the round driver".into(),
             )),
             PreparedTool::Synthetic {
                 stored,
@@ -3478,9 +2163,7 @@ impl SessionEngine {
         parallel: bool,
     ) -> Result<PreparedTool, SessionError> {
         self.ensure_supported_hooks()?;
-        if let Some(prepared) = self.prepare_deferred_effect(task_id, &call).await? {
-            return Ok(prepared);
-        }
+
         let Some(stored) = self.deps.storage.get_task(task_id).await? else {
             return Err(SessionError::ContractViolation(format!(
                 "unknown task {}",
@@ -3555,94 +2238,6 @@ impl SessionEngine {
             }
         };
 
-        let approved = if self.sdk_review_driver {
-            if let Some(receipt) = self.active_review_receipt().await? {
-                let p = &receipt.pending;
-                if p.pending.task_id == task_id
-                    && p.pending.round == round
-                    && p.binding.original_call.id == call.id
-                {
-                    let assistant = entries
-                        .iter()
-                        .find(|entry| entry.record.id == p.assistant_entry);
-                    let calls: Vec<ToolCall> = assistant
-                        .and_then(|entry| entry.record.data.get("tool_calls"))
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .ok_or_else(|| {
-                            SessionError::InvalidState("missing accepted review assistant".into())
-                        })?;
-                    if p.version != 1
-                        || p.pending.session_id != self.spec.session_id
-                        || p.pending.conversation_id != self.conversation_id
-                        || p.binding.assistant_entry != p.assistant_entry
-                        || p.binding.original_call != call
-                        || p.original_arguments != call.arguments
-                        || calls.get(p.pending.ordinal) != Some(&call)
-                        || validate_round_prefix(&entries, task_id, round, &calls)?
-                            != p.pending.ordinal
-                        || !assistant.is_some_and(|entry| {
-                            entry.record.by_task_id == Some(task_id)
-                                && entry.record.kind == entry_kind::ASSISTANT
-                                && entry
-                                    .record
-                                    .data
-                                    .get("round")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0)
-                                    == round
-                        })
-                        || !matches!(&p.pending.action, rusty_bot_core::ReviewAction::Tool { pub_call } if pub_call.id == call.id && pub_call.name == call.name && pub_call.arguments == p.final_arguments)
-                        || !tool.as_ref().is_some_and(|t| {
-                            p.binding.tool
-                                == crate::review_state::ToolSnapshot {
-                                    spec: t.spec(),
-                                    replay: t.replay(),
-                                    mode: t.execution_mode(),
-                                }
-                        })
-                        || p.binding.pending != p.pending
-                        || p.binding.final_arguments != p.final_arguments
-                        || crate::review_state::fingerprint(
-                            &serde_json::to_value(&p.binding).map_err(|_| {
-                                SessionError::InvalidState("invalid review binding".into())
-                            })?,
-                        )? != p.fingerprint
-                    {
-                        return Err(SessionError::InvalidState(
-                            "invalid accepted review binding".into(),
-                        ));
-                    }
-                    Some(match &receipt.answer.decision {
-                        rusty_bot_core::ReviewDecision::Approve
-                            if p.pending
-                                .allowed_decisions
-                                .contains(&rusty_bot_core::DecisionKind::Approve) =>
-                        {
-                            p.final_arguments.clone()
-                        }
-                        rusty_bot_core::ReviewDecision::Edit { arguments }
-                            if p.pending
-                                .allowed_decisions
-                                .contains(&rusty_bot_core::DecisionKind::Edit) =>
-                        {
-                            arguments.clone()
-                        }
-                        _ => {
-                            return Err(SessionError::InvalidState(
-                                "invalid accepted review decision".into(),
-                            ))
-                        }
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let reexecute = match tool_task::recovery_decision(
             operation.as_ref(),
             checkpoint_replay,
@@ -3665,7 +2260,7 @@ impl SessionEngine {
                     status: operation.status,
                 });
             }
-            RecoveryDecision::Interrupt => {
+            RecoveryDecision::Stop => {
                 return Ok(PreparedTool::Interrupted {
                     stored,
                     call,
@@ -3678,12 +2273,6 @@ impl SessionEngine {
             RecoveryDecision::Reexecute => true,
         };
 
-        if self.sdk_review_driver && self.spec.review_enabled && operation.is_some() && !reexecute {
-            return Err(SessionError::InvalidState(
-                "unexpected review operation".into(),
-            ));
-        }
-
         // Once intent exists, the journal is the source of truth for the
         // effect, not the original model-visible call. In particular a hook
         // may have rewritten the arguments before recording intent.
@@ -3694,10 +2283,9 @@ impl SessionEngine {
                 .request
                 .clone()
         } else {
-            approved.clone().unwrap_or_else(|| call.arguments.clone())
+            call.arguments.clone()
         };
-        let question = call.name == "ask_user" && self.ask_user_enabled();
-        if tool.is_none() && !question && !reexecute {
+        if tool.is_none() && !reexecute {
             let output = ToolOutput::error(format!("unknown tool: {}", call.name), "unknown_tool");
             return Ok(PreparedTool::Synthetic {
                 stored,
@@ -3706,14 +2294,7 @@ impl SessionEngine {
                 output,
             });
         }
-        if question && !valid_question(&execution_arguments) {
-            return Ok(PreparedTool::Synthetic {
-                stored,
-                call,
-                round,
-                output: ToolOutput::error("invalid question", "invalid_arguments"),
-            });
-        }
+
         if let Some(tool) = &tool {
             if let Err(message) = validate_arguments(tool, &execution_arguments) {
                 let output = ToolOutput {
@@ -3733,7 +2314,7 @@ impl SessionEngine {
             }
         }
 
-        if !reexecute && approved.is_none() {
+        if !reexecute {
             let mut gated = call.clone();
             let blocked = self
                 .hook_dispatcher(self.cancel.clone())
@@ -3741,9 +2322,6 @@ impl SessionEngine {
                 .await?;
             let invalid = match &tool {
                 Some(tool) => validate_arguments(tool, &gated.arguments).err(),
-                None if question && !valid_question(&gated.arguments) => {
-                    Some("invalid question".into())
-                }
                 None => None,
             };
             if let Some(message) = blocked.or(invalid) {
@@ -3755,54 +2333,7 @@ impl SessionEngine {
                     output,
                 });
             }
-            if self.sdk_review_driver && self.spec.review_enabled {
-                use rusty_bot_core::DecisionKind;
-                let allowed = if question {
-                    Some(
-                        [DecisionKind::Respond, DecisionKind::Reject]
-                            .into_iter()
-                            .collect(),
-                    )
-                } else if let Some(selected) = self.resolved.selected_review_gate()? {
-                    let ctx = rusty_bot_core::HookContext::new(
-                        self.spec.session_id,
-                        self.conversation_id,
-                        task_id,
-                        task_id,
-                        selected.descriptor.config.clone(),
-                        self.cancel.clone(),
-                        self.deps.storage.clone(),
-                    );
-                    let request = AssertUnwindSafe(selected.gate.review(&gated, &ctx))
-                        .catch_unwind()
-                        .await
-                        .map_err(|_| SessionError::InvalidState("review gate failed".into()))?
-                        .map_err(|_| SessionError::InvalidState("review gate failed".into()))?;
-                    request.map(|request| request.allowed_decisions)
-                } else {
-                    None
-                };
-                if let Some(allowed) = allowed {
-                    if allowed.is_empty()
-                        || (!question
-                            && allowed.iter().any(|d| {
-                                !matches!(
-                                    d,
-                                    DecisionKind::Approve
-                                        | DecisionKind::Edit
-                                        | DecisionKind::Reject
-                                )
-                            }))
-                    {
-                        return Err(SessionError::InvalidState("invalid review policy".into()));
-                    }
-                    return Ok(PreparedTool::Review {
-                        call,
-                        final_call: gated,
-                        allowed,
-                    });
-                }
-            }
+
             execution_arguments = gated.arguments;
         }
         let now = self.deps.clock.now_ms();
@@ -3889,7 +2420,6 @@ impl SessionEngine {
             cancel: self.cancel.clone(),
             now_ms: self.deps.clock.now_ms(),
             image_limits: self.deps.provider.image_limits(),
-            interrupt_port: None,
         };
         Ok(PreparedTool::Effect(PreparedToolEffect {
             identity: ToolEffectIdentity {
@@ -3902,7 +2432,6 @@ impl SessionEngine {
             tool,
             arguments: execution_arguments,
             context,
-            interrupt_answers: self.interrupt_effect_driver.then(Vec::new),
         }))
     }
 
@@ -3943,7 +2472,7 @@ impl SessionEngine {
         // details) for aborts. Recognize that output only when cancellation was
         // actually requested, so the operation journal records interruption
         // instead of incorrectly treating a killed subprocess as a normal error.
-        let builtin_shell_aborted = matches!(call.name.as_str(), "bash" | "powershell")
+        let builtin_shell_aborted = call.name == "bash"
             && self.cancel.is_cancelled()
             && output.is_error
             && output.details.is_none()
@@ -4108,16 +2637,9 @@ impl SessionEngine {
             updated_at: now,
         };
         let deferred = self.deferred.drain();
-        let interrupt_writes = if self.interrupt_effect_driver {
-            self.interrupt_completion_writes(stored.record.id, &call.id)
-                .await?
-        } else {
-            Vec::new()
-        };
+
         let mut tx = self.conversation_tx();
-        for write in interrupt_writes {
-            tx.write(write)?;
-        }
+
         tx.write(Write::Event(SessionEventDraft {
             kind: event_kind::ENTRY_COMMITTED.into(),
             payload: json!({ "entry_id": entry_id.0, "kind": entry_kind::TOOL_RESULT }),
@@ -4143,36 +2665,8 @@ impl SessionEngine {
         Ok(is_error)
     }
 
-    // Do not fabricate a tool result for unsupported pauses or swallowed
-    // control signals. Retain the intent metadata for conservative recovery.
-    async fn mark_effect_uncertain(
-        &mut self,
-        task_id: TaskId,
-        key: &str,
-    ) -> Result<(), SessionError> {
-        let mut operation = self
-            .deps
-            .storage
-            .get_operation(task_id, key)
-            .await?
-            .ok_or_else(|| SessionError::InvalidState("missing tool intent".into()))?;
-        operation.status = ToolOperationStatus::Uncertain;
-        // An explicitly uncertain interrupt-driver effect must not be replayed
-        // merely because its declared replay policy is Safe.
-        if self.interrupt_effect_driver {
-            if let Ok(Some(replay)) = tool_task::recorded_replay(&operation) {
-                operation.result = Some(tool_task::parallel_intent(replay, true));
-            } else {
-                operation.result = Some(json!({"replayed": true}));
-            }
-        }
-        operation.updated_at = self.deps.clock.now_ms();
-        let mut tx = self.conversation_tx();
-        tx.write(Write::ToolOperation(operation))?;
-        tx.commit().await?;
-        Ok(())
-    }
-
+    // Commit a terminal cancellation/recovery result while retaining replay
+    // metadata, so an uncertain external effect cannot execute again unsafely.
     async fn commit_interrupted(
         &mut self,
         stored: &StoredTask,
@@ -4269,29 +2763,10 @@ impl SessionEngine {
             result: Some(result),
             updated_at: now,
         };
-        let interrupt_writes = if self.interrupt_effect_driver {
-            self.interrupt_completion_writes(stored.record.id, &call.id)
-                .await?
-        } else {
-            Vec::new()
-        };
-        let failure_review = if !defer_terminal {
-            self.review_disposition_write(
-                stored.record.id,
-                crate::review_state::ReceiptDisposition::TerminalFailure,
-            )
-            .await?
-        } else {
-            None
-        };
+
         let deferred = self.deferred.drain();
         let mut tx = self.conversation_tx();
-        for write in interrupt_writes {
-            tx.write(write)?;
-        }
-        if let Some(write) = failure_review {
-            tx.write(Write::Document(write))?;
-        }
+
         tx.write(Write::Event(SessionEventDraft {
             kind: event_kind::ENTRY_COMMITTED.into(),
             payload: json!({ "entry_id": entry_id.0, "kind": entry_kind::TOOL_RESULT }),
@@ -4363,16 +2838,10 @@ impl SessionEngine {
             record.state = TaskState::Terminal { outcome };
             record.ended_at = Some(self.deps.clock.now_ms());
         }
-        let completed_review = if record.state.is_terminal() {
-            self.completed_review_write(record.id).await?
-        } else {
-            None
-        };
+
         let deferred = self.deferred.drain();
         let mut tx = self.conversation_tx();
-        if let Some(write) = completed_review {
-            tx.write(Write::Document(write))?;
-        }
+
         if let Some(entry) = answer {
             tx.write(Write::Event(SessionEventDraft {
                 kind: event_kind::ENTRY_COMMITTED.into(),
@@ -4404,7 +2873,6 @@ impl SessionEngine {
     }
 
     pub async fn finish_turn(&mut self, task_id: TaskId) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         let Some(stored) = self.deps.storage.get_task(task_id).await? else {
             return Err(SessionError::ContractViolation(format!(
                 "unknown task {}",
@@ -4448,11 +2916,9 @@ impl SessionEngine {
             record.ended_at = Some(self.deps.clock.now_ms());
             record.memos.remove("after_run_pending");
             record.memos.insert("after_run_done".into(), json!(true));
-            let completed_review = self.completed_review_write(task_id).await?;
+
             let mut tx = self.conversation_tx();
-            if let Some(write) = completed_review {
-                tx.write(Write::Document(write))?;
-            }
+
             tx.write(Write::Task(record.clone()))?;
             tx.write(Write::Event(SessionEventDraft {
                 kind: event_kind::TASK_CHANGED.into(),
@@ -4505,16 +2971,10 @@ impl SessionEngine {
         if writes.is_empty() {
             return Ok(());
         }
-        let completed_review = if record.state.is_terminal() {
-            self.completed_review_write(task_id).await?
-        } else {
-            None
-        };
+
         let deferred = self.deferred.drain();
         let mut tx = self.conversation_tx();
-        if let Some(write) = completed_review {
-            tx.write(Write::Document(write))?;
-        }
+
         for write in writes {
             tx.write(write)?;
         }
@@ -4538,7 +2998,6 @@ impl SessionEngine {
         task_id: Option<TaskId>,
         reason: &str,
     ) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         let task = match task_id {
             Some(id) => self.deps.storage.get_task(id).await?,
             None => {
@@ -4589,7 +3048,6 @@ impl SessionEngine {
     /// (effect may have run), which is terminal for the idempotency key, so no
     /// retry can repeat the effect.
     pub async fn abort_task(&mut self, task_id: TaskId, reason: &str) -> Result<(), SessionError> {
-        self.guard_review_host().await?;
         let Some(stored) = self.deps.storage.get_task(task_id).await? else {
             return Ok(());
         };
@@ -4654,17 +3112,9 @@ impl SessionEngine {
         };
         record.ended_at = Some(now);
 
-        let failure_review = self
-            .review_disposition_write(
-                task_id,
-                crate::review_state::ReceiptDisposition::TerminalFailure,
-            )
-            .await?;
         let deferred = self.deferred.drain();
         let mut tx = self.conversation_tx();
-        if let Some(write) = failure_review {
-            tx.write(Write::Document(write))?;
-        }
+
         for (call, key) in pending_tools {
             if let Some(operation) = self.deps.storage.get_operation(task_id, &key).await? {
                 if matches!(
@@ -4810,12 +3260,6 @@ impl SessionEngine {
                 }
                 WorkItem::ExecuteTool { task_id, .. } => {
                     self.execute_tool_round(task_id, &cancel).await?;
-                    if self.paused_review.is_some() {
-                        return Ok(RunOutcome {
-                            turns_completed: turns,
-                            idled: false,
-                        });
-                    }
                 }
                 WorkItem::FinishTurn { task_id } => {
                     self.finish_turn(task_id).await?;
@@ -4891,26 +3335,12 @@ impl SessionEngine {
         )
         .map_err(|_| SessionError::InvalidState("malformed round calls".into()))?;
         let prefix = validate_round_prefix(&entries, task_id, round, &calls)?;
-        let modes: Vec<_> = calls
-            .iter()
-            .map(|call| {
-                self.tools
-                    .model_visible
-                    .contains(&call.name)
-                    .then(|| self.tools.get(&call.name))
-                    .flatten()
-                    .map(|tool| tool.execution_mode())
-                    .unwrap_or(rusty_bot_core::ExecutionMode::Sequential)
-            })
-            .collect();
         let mut active = FuturesUnordered::new();
         let mut outcomes = BTreeMap::new();
         let mut launch = prefix;
         let mut settle = prefix;
         let mut failure: Option<SessionError> = None;
         let mut interrupted = false;
-        let mut fence = false;
-        let mut review = None;
         loop {
             if failure.is_none() && !outcomes.contains_key(&settle) && !active.is_empty() {
                 // Give already-started effects a poll between preparations. This
@@ -4922,22 +3352,13 @@ impl SessionEngine {
                         cancel.cancel();
                     }
                     outcomes.insert(ordinal, outcome);
-                    if active.is_empty() {
-                        fence = false;
-                    }
                 }
             }
             while failure.is_none()
                 && !interrupted
                 && !cancel.is_cancelled()
-                && review.is_none()
                 && launch < calls.len()
-                && active.len() < self.max_parallel_tools.get()
             {
-                let sequential = modes[launch] == rusty_bot_core::ExecutionMode::Sequential;
-                if fence || (sequential && !active.is_empty()) {
-                    break;
-                }
                 let ordinal = launch;
                 let preparation = AssertUnwindSafe(self.prepare_tool_effect_with_metadata(
                     task_id,
@@ -4975,19 +3396,6 @@ impl SessionEngine {
                 };
                 launch += 1;
                 match prepared {
-                    PreparedTool::Review {
-                        call,
-                        final_call,
-                        allowed,
-                    } => {
-                        review = Some(ReviewCandidate {
-                            ordinal,
-                            call,
-                            final_call,
-                            allowed,
-                        });
-                        break;
-                    }
                     PreparedTool::Effect(effect) if cancel.is_cancelled() => {
                         outcomes.insert(
                             ordinal,
@@ -5022,17 +3430,9 @@ impl SessionEngine {
                                 },
                             )
                         });
-                        fence = sequential;
-                        if sequential {
-                            break;
-                        }
                     }
                     other => {
                         outcomes.insert(ordinal, RoundResult::Prepared(other));
-                        if sequential {
-                            fence = true;
-                            break;
-                        }
                     }
                 }
             }
@@ -5051,16 +3451,8 @@ impl SessionEngine {
                         RoundResult::Prepared(prepared) => {
                             self.settle_prepared_tool(prepared, true).await
                         }
-                        RoundResult::Effect(identity, InvocationResult::Returned(result)) => {
+                        RoundResult::Effect(identity, result) => {
                             self.settle_tool_effect(&identity, result, true).await
-                        }
-                        RoundResult::Effect(_, InvocationResult::Interrupted(_)) => {
-                            Err(SessionError::InterruptUnsupported)
-                        }
-                        RoundResult::Effect(_, InvocationResult::ProtocolViolation) => {
-                            Err(SessionError::InterruptProtocol(
-                                "tool did not propagate interrupt or replay diverged".into(),
-                            ))
                         }
                         RoundResult::Panicked(identity) => {
                             self.commit_interrupted(
@@ -5113,11 +3505,9 @@ impl SessionEngine {
                 settle += 1;
             }
             if active.is_empty() {
-                fence = false;
                 if failure.is_some()
                     || interrupted
                     || cancel.is_cancelled()
-                    || review.is_some()
                     || launch == calls.len()
                 {
                     break;
@@ -5130,28 +3520,10 @@ impl SessionEngine {
                     cancel.cancel();
                 }
                 outcomes.insert(ordinal, outcome);
-                if active.is_empty() {
-                    fence = false;
-                }
             }
         }
-        if failure.is_none() && !interrupted && !cancel.is_cancelled() {
-            if let Some(candidate) = review {
-                if settle != candidate.ordinal {
-                    return Err(SessionError::InvalidState(
-                        "review prefix did not settle".into(),
-                    ));
-                }
-                self.commit_review(task_id, round, assistant.record.id, &calls, candidate)
-                    .await?;
-                return Ok(());
-            }
-        }
+
         if let Some(error) = failure {
-            let interrupt_failure = matches!(
-                error,
-                SessionError::InterruptUnsupported | SessionError::InterruptProtocol(_)
-            );
             // Active effects are now drained. Reconcile journaled calls in
             // order without invoking hooks. If storage fails, retain the
             // existing intents for conservative recovery and the first error.
@@ -5192,9 +3564,7 @@ impl SessionEngine {
                             self.deps.storage.get_task(task_id).await?.ok_or_else(|| {
                                 SessionError::InvalidState("missing failed round task".into())
                             })?;
-                        if interrupt_failure {
-                            self.mark_effect_uncertain(task_id, &key).await?;
-                        } else {
+                        {
                             self.commit_interrupted(
                                 &current,
                                 call,
@@ -5229,16 +3599,9 @@ impl SessionEngine {
                             let submission = self
                                 .settled_submission(&record, Some(message.into()))
                                 .await?;
-                            let failure_review = self
-                                .review_disposition_write(
-                                    task_id,
-                                    crate::review_state::ReceiptDisposition::TerminalFailure,
-                                )
-                                .await?;
+
                             let mut tx = self.conversation_tx();
-                            if let Some(write) = failure_review {
-                                tx.write(Write::Document(write))?;
-                            }
+
                             tx.write(Write::Task(record.clone()))?;
                             tx.write(Write::Event(SessionEventDraft {
                                 kind: event_kind::TASK_CHANGED.into(),
@@ -5279,16 +3642,9 @@ impl SessionEngine {
                 let submission = self
                     .settled_submission(&record, Some(message.into()))
                     .await?;
-                let completed_review = self
-                    .review_disposition_write(
-                        task_id,
-                        crate::review_state::ReceiptDisposition::TerminalFailure,
-                    )
-                    .await?;
+
                 let mut tx = self.conversation_tx();
-                if let Some(write) = completed_review {
-                    tx.write(Write::Document(write))?;
-                }
+
                 tx.write(Write::Task(record.clone()))?;
                 tx.write(Write::Event(SessionEventDraft {
                     kind: event_kind::TASK_CHANGED.into(),
@@ -5867,17 +4223,10 @@ impl SessionEngine {
             },
         };
         record.ended_at = Some(now);
-        let completed_review = self
-            .review_disposition_write(
-                record.id,
-                crate::review_state::ReceiptDisposition::TerminalFailure,
-            )
-            .await?;
+
         let deferred = self.deferred.drain();
         let mut tx = self.conversation_tx();
-        if let Some(write) = completed_review {
-            tx.write(Write::Document(write))?;
-        }
+
         tx.write(Write::Task(record.clone()))?;
         tx.write(Write::Event(SessionEventDraft {
             kind: event_kind::TASK_CHANGED.into(),

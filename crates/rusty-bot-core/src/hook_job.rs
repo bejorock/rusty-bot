@@ -54,6 +54,10 @@ pub enum HookJobError {
     Failed(HookError),
 }
 
+#[cfg(test)]
+#[path = "hook_job_tests.rs"]
+mod tests;
+
 type Output = Box<dyn Any + Send>;
 type Work = Pin<Box<dyn Future<Output = Result<Output, HookError>> + Send>>;
 type Completion = Box<dyn FnOnce(Result<Output, HookJobError>) + Send>;

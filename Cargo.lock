@@ -1714,6 +1714,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "rusty-bot"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "jsonschema",
  "rusty-bot-core",
  "rusty-bot-engine",
@@ -1756,6 +1757,7 @@ dependencies = [
  "jsonschema",
  "regex",
  "rusty-bot-core",
+ "rusty-bot-memory",
  "schemars",
  "serde",
  "serde_json",
@@ -1797,7 +1799,9 @@ name = "rusty-bot-memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "rusty-bot-core",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -1809,6 +1813,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
+ "http",
  "image",
  "percent-encoding",
  "reqwest",

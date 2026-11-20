@@ -57,7 +57,6 @@ impl std::error::Error for ExecutionError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandSpec {
     Shell { command: String },
-    PowerShell { command: String },
     Argv { program: String, args: Vec<String> },
 }
 

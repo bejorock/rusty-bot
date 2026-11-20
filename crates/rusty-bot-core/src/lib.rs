@@ -19,13 +19,11 @@ pub mod hook;
 pub mod hook_job;
 pub mod ids;
 pub mod image_validation;
-pub mod interrupt;
 pub mod live;
 pub mod message;
 pub mod model;
 pub mod payload_validation;
 pub mod records;
-pub mod review;
 pub mod shell;
 pub mod storage;
 pub mod task;
@@ -69,7 +67,6 @@ pub use ids::{
     ConversationId, DocumentId, EntryId, Id, OwnerRef, ParentRef, Seq, SessionId, SubmissionId,
     TaskId, TimestampMs,
 };
-pub use interrupt::{InterruptId, PendingInterrupt};
 pub use live::{LiveFrame, LiveKind, LiveSink, NullLiveSink};
 pub use message::{ContentPart, ContextEdit, EditKind, Message, StopReason, ToolCall, Usage};
 pub use model::{
@@ -82,10 +79,6 @@ pub use records::{
     entry_kind, ConversationRecord, EntryRecord, SubmissionKind, SubmissionRecord,
     SubmissionStatus, ToolOperationRecord, ToolOperationStatus,
 };
-pub use review::{
-    DecisionKind, PendingReview, ReviewAction, ReviewAnswer, ReviewDecision, ReviewGate, ReviewId,
-    ReviewRequest,
-};
 pub use shell::{
     CommandSpec, ExecOptions, ExecutionError, ExecutionErrorCode, OutputCallback, OutputChunk,
     OutputMode, OutputStream, Shell, ShellExecResult, SpillPolicy,
@@ -97,7 +90,7 @@ pub use storage::{
 pub use task::{
     ReplayPolicy, TaskOutcome, TaskRecord, TaskState, ToolCheckpoint, WaitPolicy, WakeSpec,
 };
-pub use tool::{ExecutionMode, Tool, ToolContext, ToolError, ToolInterruptPort, ToolOutput};
+pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
 pub use truncate::{truncate_text, TruncatedText, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 pub use workspace::{
     ExecutionSelection, Workspace, WorkspaceError, WorkspaceKey, WorkspaceProvider, WorkspaceSpec,
@@ -105,3 +98,10 @@ pub use workspace::{
 
 /// Crate version string, useful for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use storage::SessionFrame;
+/// Replaceable session persistence and progress-log interface.
+pub use storage::Storage as SessionAdapter;
+
+#[cfg(test)]
+mod unit_tests;

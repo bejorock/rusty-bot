@@ -13,6 +13,14 @@ use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[path = "anthropic_replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
+#[path = "anthropic_tests.rs"]
+mod tests;
+
 const FORMAT: &str = "anthropic.messages.v1";
 
 pub struct AnthropicMessagesProvider {
@@ -348,6 +356,10 @@ async fn emit(
 ) -> Result<(), ModelError> {
     tokio::select! { biased; _ = cancel.cancelled() => Err(ModelError::cancelled()), result = tx.send(event) => { let _ = result; Ok(()) } }
 }
+
+#[cfg(test)]
+#[path = "anthropic_stream_tests.rs"]
+mod stream_tests;
 
 struct Accumulator {
     started: bool,

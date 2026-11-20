@@ -10,16 +10,6 @@ use crate::model::ToolSpec;
 use crate::shell::Shell;
 use crate::task::ReplayPolicy;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    /// Tools may be executed concurrently in a future milestone. M1 runs one
-    /// call at a time even though this is the default policy.
-    #[default]
-    Parallel,
-    Sequential,
-}
-
 pub struct ToolContext {
     pub session_id: SessionId,
     pub conversation_id: ConversationId,
@@ -30,35 +20,6 @@ pub struct ToolContext {
     pub cancel: tokio_util::sync::CancellationToken,
     pub now_ms: i64,
     pub image_limits: Option<crate::model::ImageLimits>,
-    /// Engine-owned invocation binding. Standalone contexts must set this to `None`.
-    #[doc(hidden)]
-    pub interrupt_port: Option<Arc<dyn ToolInterruptPort>>,
-}
-
-/// Internal engine side channel; callers should use [`ToolContext::interrupt`].
-#[doc(hidden)]
-pub trait ToolInterruptPort: Send + Sync {
-    fn interrupt(&self, payload: serde_json::Value) -> Result<serde_json::Value, ToolError>;
-}
-
-impl ToolContext {
-    /// Return a recorded positional answer or request an interrupt of this tool.
-    ///
-    /// Propagate errors with `?`. A resumed tool restarts from its beginning;
-    /// effects before this call may happen again. Calls must be sequenced for
-    /// deterministic positional replay. This does not suspend a live future.
-    pub async fn interrupt(
-        &self,
-        payload: serde_json::Value,
-    ) -> Result<serde_json::Value, ToolError> {
-        match &self.interrupt_port {
-            Some(port) => port.interrupt(payload),
-            None => Err(ToolError::new(
-                "interrupt_unavailable",
-                "no active interrupt-capable invocation",
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,9 +105,7 @@ pub trait Tool: Send + Sync {
     fn replay(&self) -> ReplayPolicy {
         ReplayPolicy::Unsafe
     }
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
+
     async fn execute(
         &self,
         arguments: serde_json::Value,

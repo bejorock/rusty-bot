@@ -4,10 +4,11 @@
 //! privileges against the same directory the file tools see. It is intended for
 //! local development and single-host deployments.
 
-#[cfg(unix)]
+#[cfg(not(unix))]
+compile_error!("rusty-bot-local requires a Unix host");
+
 mod find_fd;
 pub mod fs;
-#[cfg(unix)]
 mod grep_rg;
 #[allow(dead_code)]
 mod search;

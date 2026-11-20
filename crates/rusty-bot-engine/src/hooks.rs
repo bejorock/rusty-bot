@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::registry::ResolvedHook;
 
+#[cfg(test)]
+#[path = "hooks_unit_tests.rs"]
+mod unit_tests;
+
 pub(crate) struct Dispatcher {
     hooks: Vec<ResolvedHook>,
     session: SessionId,

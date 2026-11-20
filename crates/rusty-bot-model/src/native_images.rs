@@ -1,4 +1,8 @@
 //! Image admission at the native provider boundary, over the entire history.
+#[cfg(test)]
+#[path = "native_images_tests.rs"]
+mod tests;
+
 use rusty_bot_core::{ContentPart, HistoryPart, ImageLimits, Message, ModelError, ModelErrorKind};
 use serde_json::Value;
 

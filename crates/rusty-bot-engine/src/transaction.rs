@@ -13,6 +13,10 @@ use rusty_bot_core::{
 
 use crate::deferred::is_deferred_eligible;
 
+#[cfg(test)]
+#[path = "transaction_tests.rs"]
+mod tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TxError {
     /// A table was read after a table write was staged. Build batches from

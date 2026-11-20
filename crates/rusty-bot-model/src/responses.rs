@@ -24,6 +24,14 @@ const FORMAT: &str = "openai.responses.v1";
 
 /// Native Responses provider. `identity` is a caller-chosen stable non-secret
 /// namespace distinguishing accounts and endpoints; it is persisted in history.
+#[cfg(test)]
+#[path = "responses_replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
+#[path = "responses_tests.rs"]
+mod tests;
+
 pub struct OpenAiResponsesProvider {
     identity: String,
     transport: NativeTransport,
@@ -540,6 +548,10 @@ impl ModelProvider for OpenAiResponsesProvider {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "responses_stream_tests.rs"]
+mod stream_tests;
 
 #[derive(Default)]
 struct StreamState {

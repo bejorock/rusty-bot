@@ -8,6 +8,10 @@ use rusty_bot_core::{DocumentAddress, DocumentWrite};
 
 use crate::transaction::TxError;
 
+#[cfg(test)]
+#[path = "deferred_tests.rs"]
+mod tests;
+
 #[derive(Clone, Debug)]
 struct DeferredEntry {
     address: DocumentAddress,

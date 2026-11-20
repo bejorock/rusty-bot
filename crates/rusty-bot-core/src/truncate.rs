@@ -5,6 +5,10 @@
 //! Copyright (c) 2025 Mario Zechner). This Rust implementation is original;
 //! the limits and head/tail preservation semantics are shared.
 
+#[cfg(test)]
+#[path = "truncate_tests.rs"]
+mod tests;
+
 pub const DEFAULT_MAX_LINES: usize = 2_000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 

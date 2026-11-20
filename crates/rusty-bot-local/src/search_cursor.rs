@@ -1,4 +1,8 @@
 //! Stateless query-bound continuation tokens and bounded rendered-row paging.
+
+#[cfg(test)]
+#[path = "search_cursor_tests.rs"]
+mod tests;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rusty_bot_core::{FileError, FileErrorCode, SearchPage};
 use sha2::{Digest, Sha256};

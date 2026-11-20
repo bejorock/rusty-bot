@@ -62,90 +62,62 @@ impl LocalShell {
 }
 
 fn kill_process_group(pgid: i32) {
-    #[cfg(unix)]
     unsafe {
         if pgid > 0 {
             libc::kill(-pgid, libc::SIGKILL);
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pgid;
-        unreachable!("local process launch is disabled without process-tree cleanup");
     }
 }
 
 // A shell may exit after launching a fully redirected background process.
 // Pipe EOF and leader exit therefore do not establish group completion.
 fn process_group_exists(pgid: i32) -> bool {
-    #[cfg(unix)]
+    if pgid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    // Linux container PID 1 may leave orphaned zombies unreaped indefinitely.
+    // Zombies cannot perform effects and must not hold a command open.
+    #[cfg(target_os = "linux")]
     {
-        if pgid <= 0 {
-            return false;
-        }
-        let result = unsafe { libc::kill(-pgid, 0) };
-        if result != 0 {
-            return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        }
-        // Linux container PID 1 may leave orphaned zombies unreaped indefinitely.
-        // Zombies cannot perform effects and must not hold a command open.
-        #[cfg(target_os = "linux")]
-        {
-            let Ok(entries) = std::fs::read_dir("/proc") else {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            let Some((_, tail)) = stat.rsplit_once(')') else {
                 return true;
             };
-            for entry in entries.flatten() {
-                if !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .bytes()
-                    .all(|b| b.is_ascii_digit())
-                {
-                    continue;
-                }
-                let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-                    Ok(stat) => stat,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return true,
-                };
-                let Some((_, tail)) = stat.rsplit_once(')') else {
-                    return true;
-                };
-                let mut fields = tail.split_whitespace();
-                let (Some(state), Some(_parent), Some(group)) =
-                    (fields.next(), fields.next(), fields.next())
-                else {
-                    return true;
-                };
-                if group.parse::<i32>().ok() == Some(pgid) && state != "Z" && state != "X" {
-                    return true;
-                }
+            let mut fields = tail.split_whitespace();
+            let (Some(state), Some(_parent), Some(group)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return true;
+            };
+            if group.parse::<i32>().ok() == Some(pgid) && state != "Z" && state != "X" {
+                return true;
             }
-            false
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            true
-        }
+        false
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
-        let _ = pgid;
-        unreachable!("local process launch is disabled without process-tree cleanup");
-    }
-}
-
-// A kill-on-drop child handle alone does not contain descendants on Windows.
-// Reject before resolving an executable or spawning anything until process-tree
-// containment is established atomically at creation and held for its lifetime.
-fn ensure_process_tree_support(supported: bool) -> Result<(), ExecutionError> {
-    if supported {
-        Ok(())
-    } else {
-        Err(ExecutionError::new(
-            ExecutionErrorCode::ShellUnavailable,
-            "local command execution is unavailable: process-tree cleanup is not implemented on this platform",
-        ))
+        true
     }
 }
 
@@ -160,6 +132,10 @@ fn spill_path(policy: &SpillPolicy) -> PathBuf {
         std::process::id()
     ))
 }
+
+#[cfg(test)]
+#[path = "shell_capture_tests.rs"]
+mod tests;
 
 struct StreamCapture {
     tail: VecDeque<u8>,
@@ -351,39 +327,8 @@ impl LocalShell {
     ) -> Result<(tokio::process::Child, i32), ExecutionError> {
         let mut command = match spec {
             CommandSpec::Shell { command: script } => {
-                #[cfg(unix)]
-                {
-                    let mut cmd = Command::new("/bin/sh");
-                    cmd.arg("-c").arg(script);
-                    cmd
-                }
-                #[cfg(not(unix))]
-                {
-                    return Err(ExecutionError::new(
-                        ExecutionErrorCode::ShellUnavailable,
-                        "local shell execution is Unix-first in v1",
-                    ));
-                }
-            }
-            CommandSpec::PowerShell { command: script } => {
-                let program = powershell_program(opts).ok_or_else(|| {
-                    ExecutionError::new(
-                        ExecutionErrorCode::ShellUnavailable,
-                        "PowerShell executable not found (pwsh or Windows PowerShell)",
-                    )
-                })?;
-                let windows_powershell = program.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .eq_ignore_ascii_case("powershell.exe")
-                });
-                let suffix = if windows_powershell && !script.ends_with('`') {
-                    "\n;\nif ($?) { exit 0 }\nif (($LASTEXITCODE -eq 0) -and (\"$($Error[0].FullyQualifiedErrorId)\" -like \"NativeCommandError*\")) { exit 0 }\nexit 1"
-                } else {
-                    ""
-                };
-                let mut cmd = Command::new(program);
-                cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-                    .arg(format!("try {{ [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 }} catch {{}}\n{script}{suffix}"));
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(script);
                 cmd
             }
             CommandSpec::Argv { program, args } => {
@@ -415,7 +360,6 @@ impl LocalShell {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(unix)]
         command.process_group(0);
 
         let child = command.spawn().map_err(|error| {
@@ -450,7 +394,6 @@ impl Shell for LocalShell {
                 "command aborted before spawn",
             ));
         }
-        ensure_process_tree_support(cfg!(unix))?;
         let started = Instant::now();
         let deadline = match opts.timeout {
             Some(timeout) => Some(started.checked_add(timeout).ok_or_else(|| {
@@ -645,13 +588,10 @@ impl Shell for LocalShell {
             None => "\n... [truncated] ...\n".to_string(),
         };
         let stdout_text = capture.display(&marker);
-        #[cfg(unix)]
         let signal = {
             use std::os::unix::process::ExitStatusExt;
             status.signal()
         };
-        #[cfg(not(unix))]
-        let signal = None;
         Ok(ShellExecResult {
             exit_code: status.code(),
             signal,
@@ -735,28 +675,6 @@ async fn capture_chunk(
     Ok(())
 }
 
-fn powershell_program(opts: &ExecOptions) -> Option<PathBuf> {
-    let path = opts
-        .env
-        .get("PATH")
-        .map(std::ffi::OsString::from)
-        .or_else(|| opts.inherit_env.then(|| std::env::var_os("PATH")).flatten())?;
-    let names: &[&str] = if cfg!(windows) {
-        &["pwsh.exe", "powershell.exe"]
-    } else {
-        &["pwsh"]
-    };
-    for name in names {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
 async fn create_spill(
     policy: &SpillPolicy,
 ) -> Result<Option<(PathBuf, tokio::fs::File)>, ExecutionError> {
@@ -767,7 +685,6 @@ async fn create_spill(
         let path = spill_path(policy);
         let mut options = tokio::fs::OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)]
         options.mode(0o600);
         match options.open(&path).await {
             Ok(file) => return Ok(Some((path, file))),

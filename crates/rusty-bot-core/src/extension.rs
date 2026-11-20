@@ -23,12 +23,6 @@ pub trait Extension: Send + Sync {
     fn hook_config(&self, _hook_id: &str) -> serde_json::Value {
         serde_json::Value::Null
     }
-    fn review_gates(&self) -> Vec<Arc<dyn crate::ReviewGate>> {
-        Vec::new()
-    }
-    fn review_gate_config(&self, _gate_id: &str) -> serde_json::Value {
-        serde_json::Value::Null
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -39,10 +33,6 @@ pub enum RegistryError {
     InvalidIdentity(String),
     #[error("duplicate hook: {0}")]
     DuplicateHook(String),
-    #[error("duplicate review gate: {0}")]
-    DuplicateReviewGate(String),
-    #[error("more than one review gate selected")]
-    MultipleReviewGates,
     #[error("invalid prompt section key: {0}")]
     InvalidSectionKey(String),
     #[error("registry selection refers to unknown extension: {0}")]

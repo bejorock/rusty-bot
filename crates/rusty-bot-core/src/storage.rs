@@ -159,10 +159,50 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
-/// The single storage contract. Backends implement one transaction per batch
-/// and return a durable prefix plus optional refusal.
+/// A persisted progress frame and its adapter-local, monotonically increasing cursor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionFrame {
+    pub cursor: u64,
+    pub session_id: SessionId,
+    pub frame: crate::LiveFrame,
+}
+
+/// Abstract session adapter. Backends provide transactional state and an
+/// append-only progress log; readers stream by following that log, not a channel.
+/// Each batch is atomic and returns a durable prefix plus optional refusal.
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Append before publishing progress. Synchronous so subprocess callbacks can
+    /// persist without spawning unordered tasks. Never silently discard frames.
+    fn append_frame(
+        &self,
+        _session: SessionId,
+        _frame: crate::LiveFrame,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::unsupported("adapter has no progress log"))
+    }
+
+    async fn read_frames(
+        &self,
+        _session: SessionId,
+        _after: u64,
+        _limit: usize,
+    ) -> Result<Vec<SessionFrame>, StorageError> {
+        Err(StorageError::unsupported("adapter has no progress log"))
+    }
+
+    /// Latest progress cursor for this session, or zero for an empty log.
+    async fn last_frame_cursor(&self, session: SessionId) -> Result<u64, StorageError> {
+        let mut cursor = 0;
+        loop {
+            let frames = self.read_frames(session, cursor, 256).await?;
+            match frames.last() {
+                Some(frame) => cursor = frame.cursor,
+                None => return Ok(cursor),
+            }
+        }
+    }
+
     async fn mint_id(&self) -> Result<Id, StorageError>;
     async fn commit(
         &self,

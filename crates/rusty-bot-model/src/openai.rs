@@ -16,6 +16,10 @@ use url::Url;
 
 use crate::sse::SseParser;
 
+#[cfg(test)]
+#[path = "openai_tests.rs"]
+mod tests;
+
 #[derive(Clone)]
 pub struct OpenAiCompatConfig {
     /// Full chat-completions URL, e.g. `https://api.openai.com/v1/chat/completions`.
@@ -702,6 +706,10 @@ struct ToolCallAcc {
     arguments: String,
     started: bool,
 }
+
+#[cfg(test)]
+#[path = "openai_stream_tests.rs"]
+mod stream_tests;
 
 async fn send_event(
     events: &Sender<StreamEvent>,

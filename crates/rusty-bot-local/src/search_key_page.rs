@@ -3,6 +3,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rusty_bot_core::{FileError, FileErrorCode, SearchPage};
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+#[path = "search_key_page_tests.rs"]
+mod tests;
+
 pub(crate) struct KeyPage {
     binding: String,
     start: String,

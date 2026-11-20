@@ -26,3 +26,6 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 rusty-bot-core = { path = "../rusty-bot-core" }
+
+[dev-dependencies]
+rusty-bot-memory = { path = "../rusty-bot-memory" }

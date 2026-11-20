@@ -2,6 +2,13 @@
 //!
 //! Budgets use a conservative one-token-per-serialized-byte estimate, not a
 //! tokenizer. They include opaque payloads, tool schemas and request metadata.
+
+#[cfg(test)]
+#[path = "compaction_strategy_tests.rs"]
+mod strategy_tests;
+#[cfg(test)]
+#[path = "compaction_tests.rs"]
+mod tests;
 use async_trait::async_trait;
 use rusty_bot_core::{
     canonical_tool_calls, CompactionError, CompactionProposal, ContentPart, HistoryPart,

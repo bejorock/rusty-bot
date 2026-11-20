@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "sse_tests.rs"]
+mod tests;
+
 /// Incremental Server-Sent Events parser for OpenAI-compatible streams.
 ///
 /// Accepts `data:` lines, joins multi-line data with newlines, ignores

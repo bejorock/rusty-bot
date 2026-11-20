@@ -1,5 +1,4 @@
-//! Process-local storage implementation.
-//! State exists only as long as this storage is retained in the current process.
+//! Session adapters with an in-memory index and optional durable JSONL journal.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -13,7 +12,11 @@ use rusty_bot_core::{
     StoredSubmission, StoredTask, SubmissionId, TaskId, TaskQuery, TaskRecord, ToolOperationRecord,
     ToolOperationStatus, Write,
 };
-use tokio::sync::Mutex;
+use std::sync::Mutex;
+
+mod jsonl;
+pub use jsonl::FileSessionAdapter;
+use jsonl::{Journal, LogRecord};
 
 use rusty_bot_core::storage::{document_write_address, StoredConversation};
 
@@ -76,7 +79,7 @@ impl DocumentRow {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inner {
     next_id: Id,
     next_seq: Seq,
@@ -90,6 +93,7 @@ struct Inner {
     operations: HashMap<(TaskId, String), ToolOperationRecord>,
     events: Vec<StoredEvent>,
     sessions: HashMap<SessionId, SessionRecord>,
+    frames: Vec<rusty_bot_core::storage::SessionFrame>,
 }
 
 impl Inner {
@@ -129,6 +133,7 @@ impl From<StorageError> for ApplyError {
 /// and implements the same refusal semantics expected from PostgreSQL.
 pub struct InMemoryStorage {
     inner: Mutex<Inner>,
+    journal: Option<Mutex<Journal>>,
 }
 
 /// Supported production name for the process-local store.
@@ -144,7 +149,18 @@ impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::new()),
+            journal: None,
         }
+    }
+
+    fn persist(&self, record: &LogRecord) -> Result<(), StorageError> {
+        if let Some(journal) = &self.journal {
+            journal
+                .lock()
+                .map_err(|_| StorageError::internal("journal lock poisoned"))?
+                .append(record)?;
+        }
+        Ok(())
     }
 
     pub fn shared() -> Arc<dyn Storage> {
@@ -154,8 +170,71 @@ impl InMemoryStorage {
 
 #[async_trait::async_trait]
 impl Storage for InMemoryStorage {
+    fn append_frame(
+        &self,
+        session: SessionId,
+        frame: rusty_bot_core::LiveFrame,
+    ) -> Result<(), StorageError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
+        let record = rusty_bot_core::storage::SessionFrame {
+            cursor: inner.frames.last().map_or(1, |f| f.cursor + 1),
+            session_id: session,
+            frame,
+        };
+        self.persist(&LogRecord::Frame {
+            record: record.clone(),
+        })?;
+        inner.frames.push(record);
+        Ok(())
+    }
+
+    async fn read_frames(
+        &self,
+        session: SessionId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<rusty_bot_core::storage::SessionFrame>, StorageError> {
+        if limit == 0 {
+            return Err(StorageError::constraint("frame limit must be nonzero"));
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
+        Ok(inner
+            .frames
+            .iter()
+            .skip(inner.frames.partition_point(|f| f.cursor <= after))
+            .filter(|f| f.session_id == session)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+    async fn last_frame_cursor(&self, session: SessionId) -> Result<u64, StorageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
+        Ok(inner
+            .frames
+            .iter()
+            .rev()
+            .find(|f| f.session_id == session)
+            .map_or(0, |f| f.cursor))
+    }
+
     async fn mint_id(&self) -> Result<Id, StorageError> {
-        Ok(self.inner.lock().await.mint_id())
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
+        let id = inner.next_id;
+        self.persist(&LogRecord::Mint { id })?;
+        inner.mint_id();
+        Ok(id)
     }
 
     async fn commit(
@@ -163,15 +242,29 @@ impl Storage for InMemoryStorage {
         batches: Vec<CommitBatch>,
         ctx: &CommitContext,
     ) -> Result<CommitReceipt, StorageError> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut receipt = CommitReceipt::default();
         for (index, batch) in batches.into_iter().enumerate() {
-            match inner.apply_batch(&batch, ctx) {
-                Ok((seq, event_count)) => receipt.batches.push(StoredBatch {
-                    index,
-                    seq,
-                    event_count,
-                }),
+            let now = now_ms();
+            match inner.validate_commit(&batch) {
+                Ok(()) => {
+                    self.persist(&LogRecord::Batch {
+                        writes: batch.writes.clone(),
+                        session_id: ctx.session_id,
+                        conversation_id: ctx.conversation_id,
+                        task_id: ctx.task_id,
+                        now,
+                    })?;
+                    let (seq, event_count) = inner.apply_validated(&batch, ctx, now);
+                    receipt.batches.push(StoredBatch {
+                        index,
+                        seq,
+                        event_count,
+                    });
+                }
                 Err(ApplyError::Refusal(reason)) => {
                     receipt.refused = Some(BatchRefusal {
                         batch_index: index,
@@ -189,7 +282,10 @@ impl Storage for InMemoryStorage {
         &self,
         id: ConversationId,
     ) -> Result<Option<StoredConversation>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .conversations
             .get(&id)
@@ -204,7 +300,10 @@ impl Storage for InMemoryStorage {
         conv: ConversationId,
         id: EntryId,
     ) -> Result<Option<StoredEntry>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .entries
             .get(&conv)
@@ -222,7 +321,10 @@ impl Storage for InMemoryStorage {
         limit: usize,
     ) -> Result<Page<StoredEntry, EntryCursor>, StorageError> {
         let limit = limit.clamp(1, 1000);
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut entries: Vec<&StoredEntry> = inner
             .entries
             .get(&query.conversation_id)
@@ -278,7 +380,10 @@ impl Storage for InMemoryStorage {
         &self,
         conv: ConversationId,
     ) -> Result<Option<StoredEntry>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .entries
             .get(&conv)
@@ -295,7 +400,10 @@ impl Storage for InMemoryStorage {
     }
 
     async fn latest_entry_id(&self, conv: ConversationId) -> Result<Option<EntryId>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .entries
             .get(&conv)
@@ -308,7 +416,10 @@ impl Storage for InMemoryStorage {
         task: TaskId,
         kind: &str,
     ) -> Result<Option<StoredEntry>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .entries
             .get(&conv)
@@ -324,7 +435,10 @@ impl Storage for InMemoryStorage {
     }
 
     async fn get_task(&self, id: TaskId) -> Result<Option<StoredTask>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner.tasks.get(&id).map(|stored| StoredTask {
             record: stored.record.clone(),
             commit_seq: stored.commit_seq,
@@ -333,7 +447,10 @@ impl Storage for InMemoryStorage {
 
     async fn scan_tasks(&self, query: TaskQuery) -> Result<Vec<StoredTask>, StorageError> {
         let limit = query.limit.clamp(1, 1000);
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut tasks: Vec<&StoredTask> = inner
             .tasks
             .values()
@@ -373,7 +490,10 @@ impl Storage for InMemoryStorage {
         &self,
         id: SubmissionId,
     ) -> Result<Option<StoredSubmission>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner.submissions.get(&id).map(|stored| StoredSubmission {
             record: stored.record.clone(),
             commit_seq: stored.commit_seq,
@@ -385,7 +505,10 @@ impl Storage for InMemoryStorage {
         conv: ConversationId,
         request_id: &str,
     ) -> Result<Option<StoredSubmission>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let id = inner.request_index.get(&(conv, request_id.to_string()));
         Ok(id
             .and_then(|id| inner.submissions.get(id))
@@ -400,7 +523,10 @@ impl Storage for InMemoryStorage {
         address: &DocumentAddress,
         at: DocumentPoint,
     ) -> Result<Option<DocumentValue>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let row = inner
             .documents
             .iter()
@@ -417,7 +543,10 @@ impl Storage for InMemoryStorage {
         query: DocumentQuery,
     ) -> Result<Vec<DocumentValue>, StorageError> {
         let limit = query.limit.clamp(1, 1000);
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut values: Vec<&DocumentRow> = inner
             .documents
             .iter()
@@ -457,7 +586,10 @@ impl Storage for InMemoryStorage {
         task: TaskId,
         key: &str,
     ) -> Result<Option<ToolOperationRecord>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner.operations.get(&(task, key.to_string())).cloned())
     }
 
@@ -468,7 +600,10 @@ impl Storage for InMemoryStorage {
         limit: usize,
     ) -> Result<EventPage, StorageError> {
         let limit = limit.clamp(1, 1000);
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut events: Vec<&StoredEvent> = inner
             .events
             .iter()
@@ -495,7 +630,10 @@ impl Storage for InMemoryStorage {
         &self,
         session: SessionId,
     ) -> Result<Option<EventCursor>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner
             .events
             .iter()
@@ -508,17 +646,26 @@ impl Storage for InMemoryStorage {
     }
 
     async fn get_session(&self, id: SessionId) -> Result<Option<SessionRecord>, StorageError> {
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         Ok(inner.sessions.get(&id).cloned())
     }
 
     async fn put_session(&self, record: SessionRecord) -> Result<(), StorageError> {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let created_at_ms = inner
             .sessions
             .get(&record.session_id)
             .map(|existing| existing.created_at_ms)
             .unwrap_or(record.created_at_ms);
+        self.persist(&LogRecord::Session {
+            record: record.clone(),
+        })?;
         inner.sessions.insert(
             record.session_id,
             SessionRecord {
@@ -531,7 +678,10 @@ impl Storage for InMemoryStorage {
 
     async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError> {
         let limit = limit.clamp(1, 1000);
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::internal("session lock poisoned"))?;
         let mut sessions: Vec<&SessionRecord> = inner.sessions.values().collect();
         sessions.sort_by_key(|session| (session.created_at_ms, session.session_id.0));
         Ok(sessions.into_iter().take(limit).cloned().collect())
@@ -539,23 +689,37 @@ impl Storage for InMemoryStorage {
 }
 
 impl Inner {
-    fn apply_batch(
+    fn apply_batch_at(
         &mut self,
         batch: &CommitBatch,
         ctx: &CommitContext,
+        now: i64,
     ) -> Result<(Seq, u32), ApplyError> {
+        self.validate_commit(batch)?;
+        Ok(self.apply_validated(batch, ctx, now))
+    }
+
+    fn validate_commit(&self, batch: &CommitBatch) -> Result<(), ApplyError> {
         if batch.writes.is_empty() {
             return Err(RefusalReason::PreconditionFailed(
                 "commit batch contains no writes".into(),
             )
             .into());
         }
-        self.validate_batch(batch)?;
+        self.validate_batch(batch)
+    }
 
+    // Validation must happen under the same lock before persistence. Application
+    // cannot fail, so successful journal writes and the visible index agree.
+    fn apply_validated(
+        &mut self,
+        batch: &CommitBatch,
+        ctx: &CommitContext,
+        now: i64,
+    ) -> (Seq, u32) {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.commits.push((seq, ctx.session_id));
-        let now = now_ms();
         let mut ordinal = 0u32;
         let mut event_count = 0u32;
 
@@ -636,7 +800,7 @@ impl Inner {
                 }
             }
         }
-        Ok((seq, event_count))
+        (seq, event_count)
     }
 
     fn validate_batch(&self, batch: &CommitBatch) -> Result<(), ApplyError> {
@@ -883,6 +1047,10 @@ impl Inner {
 
 /// v1 document deltas are applied in application code. `{"set": v}` replaces,
 /// `{"merge": {...}}` shallow-merges an object, anything else replaces.
+#[cfg(test)]
+#[path = "memory_unit_tests.rs"]
+mod unit_tests;
+
 pub fn apply_delta(current: &serde_json::Value, ops: &serde_json::Value) -> serde_json::Value {
     if let Some(value) = ops.get("set") {
         return value.clone();

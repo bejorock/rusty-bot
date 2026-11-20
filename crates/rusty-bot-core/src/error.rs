@@ -37,32 +37,6 @@ pub enum SessionError {
     InvalidConfig(String),
     #[error("invalid state: {0}")]
     InvalidState(String),
-    #[error("pending review blocks submission")]
-    PendingReview,
-    #[error("review configuration mismatch")]
-    ReviewConfigMismatch,
-    #[error("review is not enabled")]
-    ReviewUnsupported,
-    #[error("invalid review: {0}")]
-    InvalidReview(String),
-    #[error("review answer conflicts with the accepted answer")]
-    ReviewConflict,
-    #[error("review already resolved")]
-    ReviewAlreadyResolved,
-    #[error("pending interrupt blocks submission")]
-    PendingInterrupt,
-    #[error("invalid interrupt: {0}")]
-    InvalidInterrupt(String),
-    #[error("interrupt answer conflicts with the accepted answer")]
-    InterruptConflict,
-    #[error("interrupt already resolved")]
-    InterruptAlreadyResolved,
-    #[error("interrupts unsupported")]
-    InterruptUnsupported,
-    #[error("interrupt protocol violation: {0}")]
-    InterruptProtocol(String),
-    #[error("interrupt replay outcome is uncertain")]
-    InterruptUncertain,
     #[error("internal: {0}")]
     Internal(String),
 }

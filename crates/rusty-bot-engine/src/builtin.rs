@@ -29,7 +29,6 @@ impl Extension for BuiltinExtension {
             Arc::new(crate::tools::GrepTool),
             Arc::new(crate::tools::FindTool),
             Arc::new(crate::tools::BashTool),
-            Arc::new(crate::tools::PowerShellTool),
         ]
     }
 

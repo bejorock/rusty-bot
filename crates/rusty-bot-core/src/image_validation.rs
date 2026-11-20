@@ -359,6 +359,10 @@ fn validate_image_bytes_with_budget(
     }
 }
 
+#[cfg(test)]
+#[path = "image_validation_tests.rs"]
+mod tests;
+
 pub fn validate_images(parts: &[ContentPart], limits: &ImageLimits) -> Result<(), &'static str> {
     let max_bytes = limits.max_bytes.min(crate::model::MAX_TOOL_IMAGE_BYTES);
     let mut total = 0usize;

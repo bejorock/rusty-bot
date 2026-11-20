@@ -117,35 +117,12 @@ pub fn search(
 ) -> Result<SearchPage, FileError> {
     check(&cancel)?;
     if let SearchRequest::Find(q) = request {
-        #[cfg(unix)]
         return crate::find_fd::find(&root, q, &cancel);
-        #[cfg(not(unix))]
-        let _ = q;
-        #[cfg(not(unix))]
-        return Err(FileError::new(
-            FileErrorCode::NotSupported,
-            Some(root),
-            "fd find adapter is only supported on Unix",
-        ));
     }
     let meta = std::fs::metadata(&root).map_err(|e| FileError::from_io(&root, &e))?;
     match request {
         SearchRequest::List(q) => list(&root, meta.is_dir(), q, &cancel),
-        SearchRequest::Grep(q) => {
-            #[cfg(unix)]
-            {
-                crate::grep_rg::grep(&root, meta.is_dir(), q, &cancel)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = q;
-                Err(FileError::new(
-                    FileErrorCode::NotSupported,
-                    Some(root),
-                    "rg grep adapter is only supported on Unix",
-                ))
-            }
-        }
+        SearchRequest::Grep(q) => crate::grep_rg::grep(&root, meta.is_dir(), q, &cancel),
         SearchRequest::Find(_) => unreachable!(),
     }
 }

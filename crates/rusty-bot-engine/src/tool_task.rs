@@ -7,6 +7,10 @@
 use rusty_bot_core::{ReplayPolicy, ToolOperationRecord, ToolOperationStatus};
 use serde_json::{json, Value};
 
+#[cfg(test)]
+#[path = "tool_task_tests.rs"]
+mod tests;
+
 const PARALLEL_METADATA: &str = "rusty_bot_parallel_intent";
 
 /// Versioned metadata is separate from legacy result payloads.
@@ -45,8 +49,9 @@ pub enum RecoveryDecision {
     Reuse,
     /// The effect may have happened but both policies are safe; execute once.
     Reexecute,
-    /// The effect may have happened and must not be repeated.
-    Interrupt,
+    /// The effect may have happened and must not be repeated. Settle the
+    /// operation terminally; no host answer or resumable pause is involved.
+    Stop,
 }
 
 /// Replay decision for an interrupted tool operation.
@@ -84,7 +89,7 @@ pub fn recovery_decision(
             {
                 RecoveryDecision::Reexecute
             } else {
-                RecoveryDecision::Interrupt
+                RecoveryDecision::Stop
             }
         }
     }

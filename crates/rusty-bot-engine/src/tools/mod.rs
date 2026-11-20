@@ -148,9 +148,6 @@ pub struct WriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn execution_mode(&self) -> rusty_bot_core::ExecutionMode {
-        rusty_bot_core::ExecutionMode::Sequential
-    }
     fn spec(&self) -> ToolSpec {
         spec(
             "write",
@@ -213,9 +210,6 @@ pub struct LegacyEditTool;
 
 #[async_trait]
 impl Tool for LegacyEditTool {
-    fn execution_mode(&self) -> rusty_bot_core::ExecutionMode {
-        rusty_bot_core::ExecutionMode::Sequential
-    }
     fn spec(&self) -> ToolSpec {
         spec(
             "edit",
@@ -506,30 +500,8 @@ struct BashArgs {
 }
 
 pub struct BashTool;
-pub struct PowerShellTool;
-
-#[async_trait]
-impl Tool for PowerShellTool {
-    fn execution_mode(&self) -> rusty_bot_core::ExecutionMode {
-        rusty_bot_core::ExecutionMode::Sequential
-    }
-    fn spec(&self) -> ToolSpec {
-        let mut definition = BashTool.spec();
-        definition.name = "powershell".into();
-        definition.description =
-            "Run a PowerShell command in the selected execution environment.".into();
-        definition
-    }
-    async fn execute(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        execute_shell(arguments, ctx, true).await
-    }
-}
-
 #[async_trait]
 impl Tool for BashTool {
-    fn execution_mode(&self) -> rusty_bot_core::ExecutionMode {
-        rusty_bot_core::ExecutionMode::Sequential
-    }
     fn spec(&self) -> ToolSpec {
         spec(
             "bash",
@@ -548,15 +520,11 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        execute_shell(arguments, ctx, false).await
+        execute_shell(arguments, ctx).await
     }
 }
 
-async fn execute_shell(
-    arguments: Value,
-    ctx: &ToolContext,
-    powershell: bool,
-) -> Result<ToolOutput, ToolError> {
+async fn execute_shell(arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
     let args: BashArgs = match serde_json::from_value(arguments) {
         Ok(args) => args,
         Err(error) => return Ok(invalid(format!("invalid bash arguments: {error}"))),
@@ -619,14 +587,8 @@ async fn execute_shell(
         spill: SpillPolicy::default(),
         ..ExecOptions::default()
     };
-    let command = if powershell {
-        CommandSpec::PowerShell {
-            command: args.command,
-        }
-    } else {
-        CommandSpec::Shell {
-            command: args.command,
-        }
+    let command = CommandSpec::Shell {
+        command: args.command,
     };
     let run = shell.exec(command, options, ctx.cancel.clone());
     tokio::pin!(run);
@@ -739,6 +701,10 @@ fn flush_live(
         pending.1 = Some(std::time::Instant::now());
     }
 }
+
+#[cfg(test)]
+#[path = "shell_output_tests.rs"]
+mod shell_output_tests;
 
 fn bash_output(result: ShellExecResult) -> ToolOutput {
     let mut content = String::new();

@@ -1,6 +1,10 @@
 use super::*;
 use futures::StreamExt;
 
+#[cfg(test)]
+#[path = "phase1_read_tests.rs"]
+mod tests;
+
 pub struct ReadTool;
 
 // Bounded selected-line storage with complete byte/line accounting. Coding-agent

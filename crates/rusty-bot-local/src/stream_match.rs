@@ -6,6 +6,10 @@ use regex_automata::{
     util::{primitives::StateID, syntax},
 };
 
+#[cfg(test)]
+#[path = "stream_match_tests.rs"]
+mod tests;
+
 pub struct Matcher {
     nfa: NFA,
     active: Vec<StateID>,

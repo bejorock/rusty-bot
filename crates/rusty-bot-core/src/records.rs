@@ -97,6 +97,7 @@ pub enum ToolOperationStatus {
     Running,
     Succeeded,
     Failed,
+    /// Terminal cancellation/crash-recovery record, not a resumable tool pause.
     Interrupted,
     Uncertain,
 }

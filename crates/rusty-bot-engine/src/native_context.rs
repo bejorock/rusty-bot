@@ -21,6 +21,10 @@ use uuid::Uuid;
 
 use crate::{prompt, transaction::Transaction};
 
+#[cfg(test)]
+#[path = "native_context_tests.rs"]
+mod tests;
+
 pub(crate) const NATIVE_CONTEXT_KIND: &str = "rusty-bot.internal.native-reset-context.v1";
 const MARKER_KIND: &str = "rusty-bot.internal.native-reset-marker.v1";
 const VERSION: u32 = 1;

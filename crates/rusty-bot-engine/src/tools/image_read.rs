@@ -6,6 +6,10 @@ use rusty_bot_core::{ContentPart, ImageLimits, ToolOutput};
 use std::io::Cursor;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[path = "image_read_tests.rs"]
+mod tests;
+
 pub const MAX_INPUT: usize = 20 * 1024 * 1024;
 const MAX_PIXELS: u64 = 16_000_000;
 const MAX_ENCODED: usize = 128 * 1024 * 1024;

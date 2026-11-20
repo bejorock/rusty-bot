@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rusty_bot_core::{
-    Extension, Hook, HookDescriptor, PromptSection, RegistryError, ReviewGate, Tool, ToolSpec,
+    Extension, Hook, HookDescriptor, PromptSection, RegistryError, Tool, ToolSpec,
 };
 
 use crate::session::{ExtensionSelection, ToolFilter};
@@ -36,13 +36,6 @@ impl Registry {
     /// set or versions change, which is what registry-drift detection needs.
     pub fn version(&self) -> &str {
         &self.version
-    }
-
-    pub(crate) fn contains_tool(&self, name: &str) -> bool {
-        self.extensions
-            .iter()
-            .flat_map(|extension| extension.tools())
-            .any(|tool| tool.spec().name == name)
     }
 
     pub fn extension_names(&self) -> Vec<String> {
@@ -91,7 +84,6 @@ impl Registry {
         let mut sections: Vec<PromptSection> = Vec::new();
         let mut versions = BTreeMap::new();
         let mut hooks = Vec::new();
-        let mut review_gates = Vec::new();
         for name in &names {
             let extension = self
                 .find(name)
@@ -108,16 +100,7 @@ impl Registry {
                 };
                 hooks.push(ResolvedHook { descriptor, hook });
             }
-            for gate in extension.review_gates() {
-                let descriptor = ReviewGateDescriptor {
-                    extension: name.clone(),
-                    extension_version: extension.version().to_owned(),
-                    gate: gate.id().to_owned(),
-                    gate_version: gate.version().to_owned(),
-                    config: extension.review_gate_config(gate.id()),
-                };
-                review_gates.push(ResolvedReviewGate { descriptor, gate });
-            }
+
             for tool in extension.tools() {
                 let tool_name = tool.spec().name;
                 // A later same-name tool replaces the earlier one in place.
@@ -148,7 +131,6 @@ impl Registry {
             sections,
             versions,
             hooks,
-            review_gates,
         })
     }
 
@@ -254,22 +236,6 @@ pub struct ResolvedHook {
     pub hook: Arc<dyn Hook>,
 }
 
-/// Versioned policy identity and session-scoped configuration; may be sensitive.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ReviewGateDescriptor {
-    pub extension: String,
-    pub extension_version: String,
-    pub gate: String,
-    pub gate_version: String,
-    pub config: serde_json::Value,
-}
-
-#[derive(Clone)]
-pub struct ResolvedReviewGate {
-    pub descriptor: ReviewGateDescriptor,
-    pub gate: Arc<dyn ReviewGate>,
-}
-
 #[derive(Clone, Default)]
 pub struct ResolvedExtensions {
     pub names: Vec<String>,
@@ -277,18 +243,6 @@ pub struct ResolvedExtensions {
     pub sections: Vec<PromptSection>,
     pub versions: BTreeMap<String, String>,
     pub hooks: Vec<ResolvedHook>,
-    pub review_gates: Vec<ResolvedReviewGate>,
-}
-
-impl ResolvedExtensions {
-    /// Validate selection only when review is enabled; legacy resolution is unaffected.
-    pub fn selected_review_gate(&self) -> Result<Option<&ResolvedReviewGate>, RegistryError> {
-        match self.review_gates.as_slice() {
-            [] => Ok(None),
-            [gate] => Ok(Some(gate)),
-            _ => Err(RegistryError::MultipleReviewGates),
-        }
-    }
 }
 
 impl std::fmt::Debug for ResolvedExtensions {
@@ -324,11 +278,6 @@ impl PartialEq for ResolvedExtensions {
                 .iter()
                 .map(|h| &h.descriptor)
                 .eq(other.hooks.iter().map(|h| &h.descriptor))
-            && self
-                .review_gates
-                .iter()
-                .map(|gate| &gate.descriptor)
-                .eq(other.review_gates.iter().map(|gate| &gate.descriptor))
     }
 }
 
@@ -406,19 +355,6 @@ impl RegistryBuilder {
                     "{}:{}",
                     name,
                     hook.id()
-                )));
-            }
-        }
-        let mut gate_ids = std::collections::HashSet::new();
-        for gate in extension.review_gates() {
-            if gate.id().trim().is_empty() || gate.version().trim().is_empty() {
-                return Err(RegistryError::InvalidIdentity(name.to_owned()));
-            }
-            if !gate_ids.insert(gate.id().to_owned()) {
-                return Err(RegistryError::DuplicateReviewGate(format!(
-                    "{}:{}",
-                    name,
-                    gate.id()
                 )));
             }
         }

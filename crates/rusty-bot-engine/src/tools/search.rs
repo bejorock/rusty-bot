@@ -7,6 +7,10 @@ use rusty_bot_core::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[cfg(test)]
+#[path = "search_tests.rs"]
+mod tests;
+
 const CAP: usize = 50 * 1024;
 #[derive(Deserialize)]
 struct LsArgs {

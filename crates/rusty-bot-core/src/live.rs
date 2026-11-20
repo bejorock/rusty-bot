@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{SessionId, TaskId};
 
-/// Transient progress frames for push transports. Never durable state.
+/// Progress data appended to the session adapter before readers observe it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LiveFrame {
     pub task_id: Option<TaskId>,
@@ -19,8 +19,8 @@ pub enum LiveKind {
     Progress,
 }
 
-/// Synchronous, non-blocking, lossy sink. Implementations must never panic and
-/// must never block the caller on a database round trip.
+/// Synchronous publication hook. SDK sinks persist through the session adapter;
+/// persistence failures cancel the run and are returned by RunHandle::wait.
 pub trait LiveSink: Send + Sync {
     fn publish(&self, session_id: SessionId, frame: LiveFrame);
 }

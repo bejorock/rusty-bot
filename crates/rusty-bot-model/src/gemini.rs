@@ -39,6 +39,14 @@ fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, ModelError> {
         .ok_or_else(protocol)
 }
 
+#[cfg(test)]
+#[path = "gemini_replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
+#[path = "gemini_tests.rs"]
+mod tests;
+
 pub struct GeminiGenerateContentProvider {
     identity: String,
     transport: NativeTransport,
@@ -709,6 +717,10 @@ impl ModelProvider for GeminiGenerateContentProvider {
         })
     }
 }
+#[cfg(test)]
+#[path = "gemini_stream_tests.rs"]
+mod stream_tests;
+
 #[allow(clippy::too_many_arguments)]
 async fn process_event(
     event: &str,

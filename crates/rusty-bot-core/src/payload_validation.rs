@@ -1,4 +1,8 @@
 //! Fail-closed structural validation for the restricted provider payload hook.
+#[cfg(test)]
+#[path = "payload_validation_tests.rs"]
+mod tests;
+
 use crate::{ModelError, ModelErrorKind};
 use serde_json::{Map, Value};
 

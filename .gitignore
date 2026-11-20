@@ -1,2 +1,8 @@
 # Rust build artifacts, including nested crate target directories.
 target/
+
+# Generated coverage reports (retained for local inspection).
+/coverage/
+
+# Local session journals contain source code and model output.
+.rusty-bot/

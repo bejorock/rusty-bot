@@ -2,6 +2,10 @@ use super::*;
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+#[path = "phase1_edit_tests.rs"]
+mod tests;
+
 pub struct EditTool;
 
 fn edits(args: &Value) -> Result<(String, Vec<(String, String)>), String> {
@@ -298,9 +302,6 @@ fn normalize(s: &str) -> String {
 
 #[async_trait]
 impl Tool for EditTool {
-    fn execution_mode(&self) -> rusty_bot_core::ExecutionMode {
-        rusty_bot_core::ExecutionMode::Sequential
-    }
     fn spec(&self) -> ToolSpec {
         let pair = json!({"type":"object", "properties":{"oldText":{"type":"string"},"newText":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"oneOf":[{"required":["oldText","newText"],"not":{"anyOf":[{"required":["old_text"]},{"required":["new_text"]}]}},{"required":["old_text","new_text"],"not":{"anyOf":[{"required":["oldText"]},{"required":["newText"]}]}}]});
         spec(

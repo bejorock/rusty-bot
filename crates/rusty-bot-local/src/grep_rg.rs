@@ -12,6 +12,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[path = "grep_record_tests.rs"]
+mod tests;
+
 const RECORD_CAP: usize = 64 * 1024;
 const TEXT_PREFIX: usize = 8192;
 fn error(root: &Path, code: FileErrorCode, message: impl Into<String>) -> FileError {
