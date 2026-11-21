@@ -1,16 +1,9 @@
-//! PostgreSQL persistence for Rusty Bot.
+//! PostgreSQL session persistence for the Temporal engine.
 //!
-//! This crate owns the production `Storage` implementation, schema migrations,
-//! durable event reads, and transient live notifications. There is no SQLite or
-//! JSON production fallback.
+//! Implements the SDK's `rusty_bot_session::SessionStorage` contract. The host
+//! application supplies a connection pool and explicitly initializes the schema;
+//! this crate does not configure credentials or create databases.
 
-pub mod events;
-pub mod migrate;
-pub mod storage;
+pub mod sessions;
 
-pub use events::{
-    live_payloads, PgEventListener, PgEventNotification, PgEventReader, PgLiveSink,
-    MAX_LIVE_PAYLOAD_BYTES,
-};
-pub use migrate::{connect, migrate, MIGRATOR};
-pub use storage::PgStorage;
+pub use sessions::PgSessionStorage;

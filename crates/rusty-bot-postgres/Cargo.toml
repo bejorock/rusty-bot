@@ -6,20 +6,14 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
     "postgres",
-    "macros",
-    "migrate",
     "json",
-    "uuid",
-    "chrono",
 ] }
-thiserror = { workspace = true }
+rusty-bot-session = { path = "../rusty-bot-session" }
+
+[dev-dependencies]
 tokio = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true }
-rusty-bot-core = { path = "../rusty-bot-core" }

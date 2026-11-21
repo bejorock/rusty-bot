@@ -120,7 +120,7 @@ let adapter = Arc::new(rusty_bot::FileSessionAdapter::open(journal_path)?);
 let bot = Bot::builder(provider).session_adapter(adapter).build()?;
 ```
 
-For ephemeral sessions, use `Arc::new(rusty_bot::MemoryStorage::new())`. Custom `SessionAdapter` implementations must support both transactional storage and progress-log operations. The optional `rusty-bot-postgres` storage implementation does not yet support the progress log and cannot be injected directly for SDK runs.
+For ephemeral sessions, use `Arc::new(rusty_bot::MemoryStorage::new())`. Custom `SessionAdapter` implementations must support both transactional storage and progress-log operations. `rusty-bot-postgres::PgSessionStorage` and [`rusty-bot-redis::RedisSessionStorage`](crates/rusty-bot-redis/README.md) implement the separate session contract for the [Temporal engine](crates/rusty-bot-engine-temporal/README.md); they are not storage backends for this local engine.
 
 ## Providers and customization
 
