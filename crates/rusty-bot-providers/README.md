@@ -1,13 +1,14 @@
 # rusty-bot-providers
 
-Strict streaming adapters over `rusty-bot-messages` rich history. Independent of the
-legacy `ModelProvider`, CLI, engine, and Temporal. No tool execution or persistence.
+Strict streaming adapters over `rusty-bot-messages` rich history, plus a separate
+text embedding interface. Independent of the legacy `ModelProvider`, CLI, engine,
+and Temporal. No tool execution or persistence.
 
 ## Installation
 
 ```toml
 [dependencies]
-rusty-bot-providers = "0.1"
+rusty-bot-providers = "0.1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 ```
@@ -17,8 +18,7 @@ storage, or database is required. Message types are available through
 `rusty_bot_providers::messages`; a direct `rusty-bot-messages` dependency is optional.
 The current tested minimum toolchain is Rust 1.98. Older compilers have not been
 validated; the dependency set is not compatible with the former 1.85 declaration.
-Version `0.1.0` is available on crates.io. The text embedding API described below
-is an unreleased addition; use a path or Git dependency for it until the next release.
+The text embedding API described below is available starting in version `0.1.1`.
 
 ## API
 

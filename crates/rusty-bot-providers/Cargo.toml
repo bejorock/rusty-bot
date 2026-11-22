@@ -1,10 +1,10 @@
 [package]
 name = "rusty-bot-providers"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.98"
-description = "Unified streaming LLM providers for OpenAI, Anthropic, and DeepSeek"
+description = "Unified LLM generation and text embedding interfaces with OpenAI, Anthropic, and DeepSeek adapters"
 readme = "README.md"
 documentation = "https://docs.rs/rusty-bot-providers"
 keywords = ["llm", "openai", "anthropic", "deepseek", "streaming"]
