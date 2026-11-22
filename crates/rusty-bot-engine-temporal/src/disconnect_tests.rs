@@ -1,5 +1,8 @@
 use super::*;
-use crate::{streaming_tests::PausedModel, tests::FakeModel};
+use crate::{
+    streaming_tests::{PausedModel, ShortPausedModel},
+    tests::FakeModel,
+};
 use rusty_bot_session::MemorySessionStorage;
 
 #[tokio::test]
@@ -51,7 +54,7 @@ async fn worker_shutdown_during_generation_settles_uncertain_turn_on_fresh_worke
             namespace: std::env::var("TEMPORAL_NAMESPACE").unwrap_or_else(|_| "default".into()),
             task_queue: server.task_queue, idle_timeout: Duration::from_secs(120),
         };
-        let paused = Arc::new(PausedModel { advance: tokio::sync::Semaphore::new(0) });
+        let paused = Arc::new(ShortPausedModel(PausedModel { advance: tokio::sync::Semaphore::new(0) }));
         let engine = Engine::connect(options.clone(), paused, storage.clone()).await.unwrap();
         let session = engine.start_session(server.workflow_id, "fake".into()).await.unwrap();
         let request = session.send_request("request".into(), "hello".into());
@@ -67,17 +70,25 @@ async fn worker_shutdown_during_generation_settles_uncertain_turn_on_fresh_worke
             }
         }).await.unwrap();
         let model = Arc::new(FakeModel::default());
-        let fresh = Engine::connect(options, model.clone(), storage).await.unwrap();
+        let fresh = Engine::connect(options, model.clone(), storage.clone()).await.unwrap();
         fresh.run_until(async {
             // Cancellation/timeout is an uncertain model outcome, not permission to
             // rerun this non-idempotent external operation automatically.
-            assert!(request.await.is_err());
+            assert!(matches!(request.await.unwrap(), TurnResult::ModelFailed(_)));
             let resumed = fresh.resume_session(session.id()).await.unwrap();
             assert_eq!(resumed.run_id(), session.run_id());
             assert!(matches!(resumed.send_request("request".into(), "hello".into()).await.unwrap(), TurnResult::Rejected(_)));
             assert_eq!(resumed.snapshot().await.unwrap().messages[1].status, MessageStatus::Failed);
+            let stored = storage.read(session.id()).await.unwrap();
+            assert!(matches!(stored.turns[0].result, Some(Err(_))));
             assert!(model.requests.lock().unwrap().is_empty());
             assert_eq!(resumed.send_message("again".into()).await.unwrap(), TurnResult::Completed("reply to again; 0 prior messages".into()));
+            {
+                let requests = model.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].history.entries.len(), 1);
+                assert_eq!(requests[0].history.entries[0].message, ConversationMessage::user("again"));
+            }
             resumed.close().await.unwrap();
         }).await.unwrap();
     }).await.unwrap();

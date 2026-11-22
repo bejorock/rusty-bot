@@ -6,11 +6,11 @@ rust-version = "1.92"
 license.workspace = true
 
 [dependencies]
+dotenvy = "0.15.7"
 rusty-bot-postgres = { path = "../rusty-bot-postgres" }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
 rusty-bot-engine-temporal = { path = "../rusty-bot-engine-temporal" }
-rusty-bot-model = { path = "../rusty-bot-model" }
-secrecy.workspace = true
+rusty-bot-core = { path = "../rusty-bot-core" }
+rusty-bot-providers = { path = "../rusty-bot-providers" }
 tokio = { workspace = true, features = ["io-std", "signal"] }
 uuid.workspace = true
-url.workspace = true

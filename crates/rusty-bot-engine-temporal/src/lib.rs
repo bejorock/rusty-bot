@@ -1,12 +1,10 @@
-//! Minimal, text-only agent loop using the official Temporal SDK.
+//! Provider-neutral agent loop using the official Temporal SDK; tools are not executed.
 //! Storage is injected by the caller; all external I/O runs in Activities.
 
 use std::{sync::Arc, time::Duration};
 
-use rusty_bot_core::{
-    ChatRequest, ContentPart, Message, ModelError, ModelProvider, ProviderMessage, StopReason,
-    ToolChoice,
-};
+use rusty_bot_core::{ModelError, ModelErrorKind};
+use rusty_bot_providers::{GenerationRequest, Provider};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -56,6 +54,13 @@ pub struct SessionInput {
     /// Absolute Workflow time, carried across rollover without renewing inactivity.
     #[serde(default)]
     pub idle_deadline_ms: Option<u64>,
+    /// Provider operation budget plus persistence/signal margin, recorded in workflow history.
+    #[serde(default = "default_activity_timeout_ms")]
+    pub activity_timeout_ms: u64,
+}
+
+fn default_activity_timeout_ms() -> u64 {
+    180_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,40 +81,43 @@ pub enum TurnResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateInput {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    pub history: ChatHistory,
+    pub message_id: String,
+}
+
+fn validate_provider_model(provider: &dyn Provider, model: &str) -> Result<(), ModelError> {
+    if provider
+        .model_id()
+        .is_some_and(|configured| configured != model)
+    {
+        return Err(ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "session model does not match provider configuration",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 /// Provider clients (and credentials) stay in the Activity worker, not Workflow state.
 pub struct LlmActivities {
-    provider: Arc<dyn ModelProvider>,
+    provider: Arc<dyn Provider>,
     storage: Option<Arc<dyn SessionStorage>>,
 }
 
 impl LlmActivities {
-    pub fn new(provider: Arc<dyn ModelProvider>) -> Self {
+    pub fn new(provider: Arc<dyn Provider>) -> Self {
         Self {
             provider,
             storage: None,
         }
     }
 
-    pub fn with_storage(
-        provider: Arc<dyn ModelProvider>,
-        storage: Arc<dyn SessionStorage>,
-    ) -> Self {
+    pub fn with_storage(provider: Arc<dyn Provider>, storage: Arc<dyn SessionStorage>) -> Self {
         Self {
             provider,
             storage: Some(storage),
         }
-    }
-
-    #[cfg(test)]
-    async fn generate_text(
-        &self,
-        input: GenerateInput,
-        cancel: CancellationToken,
-    ) -> Result<String, ModelError> {
-        self.generate_with_progress(input, cancel, None).await
     }
 
     async fn generate_with_progress(
@@ -117,61 +125,49 @@ impl LlmActivities {
         input: GenerateInput,
         cancel: CancellationToken,
         progress: Option<ProgressTarget>,
-    ) -> Result<String, ModelError> {
-        let request = ChatRequest {
-            model: input.model,
-            messages: input
-                .messages
-                .into_iter()
-                .map(|message| match message {
-                    ChatMessage::User(content) => ProviderMessage::User { content },
-                    ChatMessage::Assistant(content) => ProviderMessage::Assistant {
-                        content: Some(content),
-                        tool_calls: vec![],
-                    },
-                })
-                .collect(),
+    ) -> Result<HistoryEntry, ModelError> {
+        validate_provider_model(self.provider.as_ref(), &input.model)?;
+        input
+            .history
+            .validate_complete()
+            .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string(), false))?;
+        let request = GenerationRequest {
+            message_id: input.message_id.clone(),
+            history: input.history,
             tools: vec![],
-            tool_choice: ToolChoice::None,
-            temperature: None,
-            max_tokens: None,
-            metadata: serde_json::Value::Null,
         };
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let generation = self.provider.stream(request, tx, cancel.clone());
-        let drain = async {
-            if let Some(progress) = progress {
-                progress.forward(rx).await
-            } else {
-                while rx.recv().await.is_some() {}
-                Ok(())
-            }
-        };
-        let turn = match tokio::try_join!(generation, drain) {
-            Ok((turn, ())) => turn,
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let generation = self.provider.stream(&request, tx, cancel.clone());
+        let drain = streaming::consume(rx, input.message_id.clone(), progress);
+        let (result, accumulated) = match tokio::try_join!(generation, drain) {
+            Ok(pair) => pair,
             Err(error) => {
                 cancel.cancel();
                 return Err(error);
             }
         };
-        match turn.message {
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } if tool_calls.is_empty()
-                && turn.tool_calls.is_empty()
-                && matches!(turn.stop, StopReason::Stop | StopReason::Length)
-                && content
-                    .iter()
-                    .all(|p| matches!(p, ContentPart::Text { .. })) =>
-            {
-                Ok(Message::text_content(&content))
-            }
-            _ => Err(ModelError::unsupported(
-                "Temporal prototype supports text replies only",
-            )),
+        if accumulated.response() != Some(&result)
+            || result.id != input.message_id
+            || result.turn_id.is_some()
+        {
+            return Err(ModelError::new(
+                ModelErrorKind::Protocol,
+                "provider stream completion does not match returned response",
+                false,
+            ));
         }
+        if result.message.tool_calls().next().is_some()
+            || result
+                .message
+                .content()
+                .iter()
+                .any(|b| matches!(b, ContentBlock::InvalidToolCall { .. }) || matches!(b, ContentBlock::Annotated { block, .. } if matches!(block.as_ref(), ContentBlock::InvalidToolCall { .. })))
+        {
+            return Err(ModelError::unsupported(
+                "Temporal engine does not execute tool calls",
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -182,7 +178,7 @@ impl LlmActivities {
         self: Arc<Self>,
         ctx: ActivityContext,
         input: ActivityInput,
-    ) -> Result<Result<String, ModelError>, ActivityError> {
+    ) -> Result<Result<HistoryEntry, ModelError>, ActivityError> {
         let info = ctx.info();
         let progress = ProgressTarget {
             client: ctx.client(),
@@ -197,10 +193,14 @@ impl LlmActivities {
             run_id: info.workflow_run_id.clone().expect("Workflow run"),
         };
         let cancel = CancellationToken::new();
+        let generation = self.generate_with_progress(input.request, cancel.clone(), Some(progress));
+        tokio::pin!(generation);
         tokio::select! {
-            result = self.generate_with_progress(input.request, cancel.clone(), Some(progress)) => Ok(result),
+            result = &mut generation => Ok(result),
             _ = ctx.cancelled() => {
                 cancel.cancel();
+                // Allow the provider and event consumer to unwind before acknowledging cancellation.
+                let _ = generation.await;
                 Err(ActivityError::Cancelled { details: None })
             }
         }
@@ -217,7 +217,6 @@ pub struct ChatSessionWorkflow {
     partial_sequence: u64,
     rolling_over: bool,
     settled_turns: u64,
-    has_initial_history: bool,
 }
 
 #[workflow_methods]
@@ -233,7 +232,6 @@ impl ChatSessionWorkflow {
             partial_sequence: 0,
             rolling_over: false,
             settled_turns: 0,
-            has_initial_history: false,
         }
     }
 
@@ -250,7 +248,6 @@ impl ChatSessionWorkflow {
             .await?;
         ctx.state_mut(|s| {
             s.model = loaded.config.model.clone();
-            s.has_initial_history = loaded.requires_history_translation();
             let closing = s.snapshot.closing;
             s.snapshot = loaded.snapshot();
             s.snapshot.closing |= closing;
@@ -378,9 +375,6 @@ impl ChatSessionWorkflow {
                 "session is closing; resume to start a new execution".into(),
             ));
         }
-        if ctx.state(|s| s.has_initial_history) {
-            return Ok(TurnResult::Rejected("provider-neutral history is stored, but provider translation is not implemented yet".into()));
-        }
         ctx.state_mut(|s| {
             s.snapshot.generating = true;
             s.generation += 1;
@@ -426,50 +420,78 @@ impl ChatSessionWorkflow {
             });
         }
         let turn_id = turn.id;
-        let mut messages = stored.completed_context();
-        messages.push(ChatMessage::User(request.text));
+        let history = stored.generation_history().and_then(|mut history| {
+            let mut user = HistoryEntry::completed(
+                format!("turn:{turn_id}:user"),
+                ConversationMessage::user(request.text),
+            );
+            user.turn_id = Some(turn_id);
+            history.entries.push(user);
+            history.validate_complete()?;
+            Ok(history)
+        });
         ctx.state_mut(|s| {
             let closing = s.snapshot.closing;
             s.snapshot = stored.snapshot();
             s.snapshot.closing |= closing;
             s.partial_sequence = 0;
         });
-        let result = ctx
-            .execute_activity(
-                LlmActivities::generate,
-                ActivityInput {
-                    session_id: session_id.clone(),
-                    turn_id,
-                    request: GenerateInput {
-                        model: ctx.state(|s| s.model.clone()),
-                        messages,
+        let result = match history {
+            Ok(history) => {
+                ctx.execute_activity(
+                    LlmActivities::generate,
+                    ActivityInput {
+                        session_id: session_id.clone(),
+                        turn_id,
+                        request: GenerateInput {
+                            model: ctx.state(|s| s.model.clone()),
+                            history,
+                            message_id: format!("turn:{turn_id}:assistant"),
+                        },
                     },
-                },
-                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_millis(
+                        ctx.state(|s| s.input.activity_timeout_ms),
+                    ))
                     .retry_policy(
                         temporalio_common::RetryPolicy::builder()
                             .maximum_attempts(1)
                             .build(),
                     )
                     .build(),
-            )
-            .await;
-        let persisted_result = match &result {
-            Ok(Ok(reply)) => Ok(reply.clone()),
-            Ok(Err(error)) => Err(error.message.clone()),
-            Err(error) => Err(format!("model Activity failed: {error}")),
+                )
+                .await
+            }
+            Err(error) => Ok(Err(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                error.to_string(),
+                false,
+            ))),
+        };
+        let change = match &result {
+            Ok(Ok(response)) => {
+                let mut response = response.clone();
+                response.turn_id = Some(turn_id);
+                SessionChange::FinishResponse {
+                    run_id,
+                    turn_id,
+                    response: Box::new(response),
+                }
+            }
+            Ok(Err(error)) => SessionChange::Finish {
+                run_id,
+                turn_id,
+                result: Err(error.message.clone()),
+            },
+            Err(error) => SessionChange::Finish {
+                run_id,
+                turn_id,
+                result: Err(format!("model Activity failed: {error}")),
+            },
         };
         let saved: StoredSession = ctx
             .execute_activity(
                 SessionActivities::change,
-                ChangeInput {
-                    session_id,
-                    change: SessionChange::Finish {
-                        run_id,
-                        turn_id,
-                        result: persisted_result,
-                    },
-                },
+                ChangeInput { session_id, change },
                 storage_options(),
             )
             .await?;
@@ -479,7 +501,9 @@ impl ChatSessionWorkflow {
             s.snapshot.closing |= closing;
         });
         match result? {
-            Ok(reply) => Ok(TurnResult::Completed(reply)),
+            Ok(reply) => Ok(TurnResult::Completed(rusty_bot_session::visible_text(
+                &reply.message,
+            ))),
             Err(error) => Ok(TurnResult::ModelFailed(error)),
         }
     }
@@ -525,6 +549,8 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
+mod provider_translation_tests;
+#[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
 mod response_history_tests;
@@ -540,3 +566,61 @@ mod streaming_tests;
 mod test_support;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod provider_binding_tests {
+    use super::*;
+    use rusty_bot_providers::{DiscoveryRequest, ModelPage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundProvider(AtomicUsize);
+    #[async_trait::async_trait]
+    impl Provider for BoundProvider {
+        fn model_id(&self) -> Option<&str> {
+            Some("configured-model")
+        }
+        fn build_request(&self, _: &GenerationRequest) -> Result<serde_json::Value, ModelError> {
+            unreachable!()
+        }
+        async fn list_models(
+            &self,
+            _: DiscoveryRequest,
+            _: CancellationToken,
+        ) -> Result<ModelPage, ModelError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            _: &GenerationRequest,
+            _: tokio::sync::mpsc::Sender<MessageStreamEvent>,
+            _: CancellationToken,
+        ) -> Result<HistoryEntry, ModelError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ModelError::unsupported("invoked"))
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatch_is_rejected_before_provider_invocation() {
+        let provider = Arc::new(BoundProvider(AtomicUsize::new(0)));
+        let activity = LlmActivities::new(provider.clone());
+        let error = activity
+            .generate_with_progress(
+                GenerateInput {
+                    model: "sensitive-wrong-model".into(),
+                    history: ChatHistory::default(),
+                    message_id: "response".into(),
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
+        assert!(!error.retryable);
+        assert!(!error.message.contains("sensitive-wrong-model"));
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert!(validate_provider_model(provider.as_ref(), "configured-model").is_ok());
+        assert!(validate_provider_model(&tests::FakeModel::default(), "any-model").is_ok());
+    }
+}

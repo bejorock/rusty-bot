@@ -1,50 +1,125 @@
 use super::*;
-use rusty_bot_core::{AssistantTurn, ChatRequest, StreamEvent, Usage};
+use rusty_bot_providers::{DiscoveryRequest, GenerationRequest, ModelPage, Provider};
 use temporalio_client::{
     WorkflowExecuteUpdateOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
     WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
-
 pub(super) struct PausedModel {
     pub(super) advance: tokio::sync::Semaphore,
 }
-
 #[async_trait::async_trait]
-impl ModelProvider for PausedModel {
-    fn id(&self) -> &str {
-        "paused"
+impl Provider for PausedModel {
+    fn operation_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(45))
+    }
+    fn build_request(&self, _: &GenerationRequest) -> Result<serde_json::Value, ModelError> {
+        Err(ModelError::unsupported("fake has no wire request"))
+    }
+    async fn list_models(
+        &self,
+        _: DiscoveryRequest,
+        _: CancellationToken,
+    ) -> Result<ModelPage, ModelError> {
+        Err(ModelError::unsupported("fake has no discovery"))
     }
     async fn stream(
         &self,
-        _request: ChatRequest,
-        events: tokio::sync::mpsc::Sender<StreamEvent>,
-        _cancel: CancellationToken,
-    ) -> Result<AssistantTurn, ModelError> {
-        events
-            .send(StreamEvent::TextDelta("Hello".into()))
-            .await
-            .unwrap();
-        self.advance.acquire().await.unwrap().forget();
-        events
-            .send(StreamEvent::TextDelta(", world".into()))
-            .await
-            .unwrap();
-        self.advance.acquire().await.unwrap().forget();
-        // Final output deliberately differs: Activity result, not partials, is authoritative.
-        Ok(AssistantTurn {
-            message: Message::Assistant {
-                content: vec![ContentPart::Text {
-                    text: "Hello, world!".into(),
-                }],
-                tool_calls: vec![],
-                usage: None,
-                stop: Some(StopReason::Stop),
-            },
-            tool_calls: vec![],
-            usage: Usage::default(),
-            stop: StopReason::Stop,
-            provider_metadata: serde_json::Value::Null,
+        request: &GenerationRequest,
+        events: tokio::sync::mpsc::Sender<MessageStreamEvent>,
+        cancel: CancellationToken,
+    ) -> Result<HistoryEntry, ModelError> {
+        use MessageStreamPayload as P;
+        let id = &request.message_id;
+        let operation = async {
+            test_support::send_event(&events, id, 1, P::Start).await;
+            test_support::send_event(
+                &events,
+                id,
+                2,
+                P::BlockStart {
+                    index: 0,
+                    block: BlockStart::Text,
+                },
+            )
+            .await;
+            test_support::send_event(
+                &events,
+                id,
+                3,
+                P::BlockDelta {
+                    index: 0,
+                    delta: "Hello".into(),
+                },
+            )
+            .await;
+            self.advance.acquire().await.unwrap().forget();
+            test_support::send_event(
+                &events,
+                id,
+                4,
+                P::BlockDelta {
+                    index: 0,
+                    delta: ", world".into(),
+                },
+            )
+            .await;
+            self.advance.acquire().await.unwrap().forget();
+            test_support::send_event(&events, id, 5, P::BlockEnd { index: 0 }).await;
+            let response =
+                HistoryEntry::completed(id, ConversationMessage::assistant("Hello, world!"));
+            test_support::send_event(
+                &events,
+                id,
+                6,
+                P::Completed {
+                    response: Box::new(response.clone()),
+                },
+            )
+            .await;
+            Ok(response)
+        };
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(45), operation) => result.unwrap_or_else(|_| Err(ModelError::new(rusty_bot_core::ModelErrorKind::Network, "fake timeout", false))),
+            _ = cancel.cancelled() => Err(ModelError::new(rusty_bot_core::ModelErrorKind::Network, "fake cancelled", false)),
+        }
+    }
+}
+
+/// Only the interrupted-worker test needs a short, genuinely enforced budget.
+pub(super) struct ShortPausedModel(pub(super) PausedModel);
+#[async_trait::async_trait]
+impl Provider for ShortPausedModel {
+    fn operation_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(2))
+    }
+    fn build_request(&self, request: &GenerationRequest) -> Result<serde_json::Value, ModelError> {
+        self.0.build_request(request)
+    }
+    async fn list_models(
+        &self,
+        request: DiscoveryRequest,
+        cancel: CancellationToken,
+    ) -> Result<ModelPage, ModelError> {
+        self.0.list_models(request, cancel).await
+    }
+    async fn stream(
+        &self,
+        request: &GenerationRequest,
+        events: tokio::sync::mpsc::Sender<MessageStreamEvent>,
+        cancel: CancellationToken,
+    ) -> Result<HistoryEntry, ModelError> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.0.stream(request, events, cancel),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ModelError::new(
+                rusty_bot_core::ModelErrorKind::Network,
+                "fake timeout",
+                false,
+            ))
         })
     }
 }
@@ -86,6 +161,7 @@ async fn streaming_roundtrip() {
                 idle_timeout_ms: 60_000,
                 rollover: RolloverPolicy::default(),
                 idle_deadline_ms: None,
+                activity_timeout_ms: 105_000,
             },
             WorkflowStartOptions::new(server.task_queue.clone(), server.workflow_id.clone())
                 .execution_timeout(Duration::from_secs(120))

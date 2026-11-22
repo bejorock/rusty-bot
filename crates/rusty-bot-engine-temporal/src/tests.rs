@@ -1,30 +1,53 @@
 use super::*;
-use rusty_bot_core::{AssistantTurn, ModelErrorKind, StreamEvent, Usage};
+use rusty_bot_core::ModelErrorKind;
+use rusty_bot_providers::{DiscoveryRequest, GenerationRequest, ModelPage, Provider};
 use std::sync::Mutex;
 
 #[derive(Default)]
 pub(super) struct FakeModel {
-    pub(super) requests: Mutex<Vec<ChatRequest>>,
+    pub(super) requests: Mutex<Vec<GenerationRequest>>,
 }
-
 #[async_trait::async_trait]
-impl ModelProvider for FakeModel {
-    fn id(&self) -> &str {
-        "fake"
+impl Provider for FakeModel {
+    fn operation_timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(45))
     }
-
+    fn build_request(&self, _: &GenerationRequest) -> Result<serde_json::Value, ModelError> {
+        Err(ModelError::unsupported("fake has no wire request"))
+    }
+    async fn list_models(
+        &self,
+        _: DiscoveryRequest,
+        _: CancellationToken,
+    ) -> Result<ModelPage, ModelError> {
+        Err(ModelError::unsupported("fake has no model discovery"))
+    }
     async fn stream(
         &self,
-        request: ChatRequest,
-        events: tokio::sync::mpsc::Sender<StreamEvent>,
-        _cancel: CancellationToken,
-    ) -> Result<AssistantTurn, ModelError> {
-        let text = match request.messages.last().unwrap() {
-            ProviderMessage::User { content } => content.clone(),
-            _ => panic!("last message should be user"),
+        request: &GenerationRequest,
+        events: tokio::sync::mpsc::Sender<MessageStreamEvent>,
+        _: CancellationToken,
+    ) -> Result<HistoryEntry, ModelError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let text = match &request.history.entries.last().expect("user entry").message {
+            ConversationMessage::User { .. } => request
+                .history
+                .entries
+                .last()
+                .unwrap()
+                .message
+                .text_only()
+                .map_err(|e| {
+                    ModelError::new(ModelErrorKind::InvalidRequest, e.to_string(), false)
+                })?,
+            _ => {
+                return Err(ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    "last message should be user",
+                    false,
+                ));
+            }
         };
-        let prior = request.messages.len() - 1;
-        self.requests.lock().unwrap().push(request);
         if text == "fail" {
             return Err(ModelError::new(
                 ModelErrorKind::InvalidRequest,
@@ -32,76 +55,70 @@ impl ModelProvider for FakeModel {
                 false,
             ));
         }
-        // More events than the Activity channel holds: must be drained, not deadlocked.
-        for _ in 0..40 {
-            events
-                .send(StreamEvent::TextDelta("x".into()))
-                .await
-                .unwrap();
-        }
-        let reply = format!("reply to {text}; {prior} prior messages");
-        Ok(AssistantTurn {
-            message: Message::Assistant {
-                content: vec![ContentPart::Text { text: reply }],
-                tool_calls: vec![],
-                usage: None,
-                stop: Some(StopReason::Stop),
-            },
-            tool_calls: vec![],
-            usage: Usage::default(),
-            stop: StopReason::Stop,
-            provider_metadata: serde_json::Value::Null,
-        })
+        let reply = format!(
+            "reply to {text}; {} prior messages",
+            request.history.entries.len() - 1
+        );
+        let response =
+            HistoryEntry::completed(&request.message_id, ConversationMessage::assistant(reply));
+        super::test_support::emit_text(&events, &request.message_id, &response, &vec!["x"; 40])
+            .await;
+        Ok(response)
     }
 }
-
 #[tokio::test]
 async fn activity_maps_full_context_and_drains_provisional_events() {
     let model = Arc::new(FakeModel::default());
     let activity = LlmActivities::new(model.clone());
-    let messages = vec![
-        ChatMessage::User("first".into()),
-        ChatMessage::Assistant("answer".into()),
-        ChatMessage::User("second".into()),
-    ];
+    let history = ChatHistory {
+        schema_version: 1,
+        entries: vec![
+            HistoryEntry::completed("1", ConversationMessage::user("first")),
+            HistoryEntry::completed("2", ConversationMessage::assistant("answer")),
+            HistoryEntry::completed("3", ConversationMessage::user("second")),
+        ],
+    };
     let reply = tokio::time::timeout(
         Duration::from_secs(2),
-        activity.generate_text(
+        activity.generate_with_progress(
             GenerateInput {
                 model: "test-model".into(),
-                messages,
+                history: history.clone(),
+                message_id: "response".into(),
             },
             CancellationToken::new(),
+            None,
         ),
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(reply, "reply to second; 2 prior messages");
-    let requests = model.requests.lock().unwrap();
-    assert_eq!(requests[0].model, "test-model");
-    assert_eq!(requests[0].messages.len(), 3);
     assert_eq!(
-        requests[0].messages[1],
-        ProviderMessage::Assistant {
-            content: Some("answer".into()),
-            tool_calls: vec![]
-        }
+        reply.message.text_only().unwrap(),
+        "reply to second; 2 prior messages"
     );
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests[0].history, history);
     assert!(requests[0].tools.is_empty());
-    assert_eq!(requests[0].tool_choice, ToolChoice::None);
 }
-
 #[tokio::test]
 async fn model_errors_remain_serializable_activity_results() {
     let activity = LlmActivities::new(Arc::new(FakeModel::default()));
     let error = activity
-        .generate_text(
+        .generate_with_progress(
             GenerateInput {
                 model: "fake".into(),
-                messages: vec![ChatMessage::User("fail".into())],
+                history: ChatHistory {
+                    schema_version: 1,
+                    entries: vec![HistoryEntry::completed(
+                        "user",
+                        ConversationMessage::user("fail"),
+                    )],
+                },
+                message_id: "response".into(),
             },
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -216,6 +233,7 @@ async fn temporal_roundtrip() {
                 idle_timeout_ms: 60_000,
                 rollover: RolloverPolicy::default(),
                 idle_deadline_ms: None,
+                activity_timeout_ms: 105_000,
             },
             WorkflowStartOptions::new(server.task_queue.clone(), server.workflow_id.clone())
                 .execution_timeout(Duration::from_secs(120))
@@ -359,9 +377,71 @@ async fn temporal_roundtrip() {
     assert_eq!(
         requests
             .iter()
-            .map(|r| r.messages.len())
+            .map(|r| r.history.entries.len())
             .collect::<Vec<_>>(),
         [1, 3, 3, 5, 7]
     );
-    assert_eq!(requests[2].messages[..2], requests[1].messages[..2]);
+    assert_eq!(
+        requests[2].history.entries[..2],
+        requests[1].history.entries[..2]
+    );
+}
+
+#[tokio::test]
+async fn fake_provider_records_resolved_tool_context_without_projection() {
+    let model = Arc::new(FakeModel::default());
+    let activity = LlmActivities::new(model.clone());
+    let history = ChatHistory {
+        schema_version: 1,
+        entries: vec![
+            HistoryEntry::completed("question", ConversationMessage::user("lookup")),
+            HistoryEntry::completed(
+                "call",
+                ConversationMessage::Assistant {
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            call: ToolInvocation {
+                                id: "call-1".into(),
+                                name: "lookup".into(),
+                                arguments: serde_json::json!({"key":"value"}),
+                            },
+                        },
+                        ContentBlock::Replay {
+                            state: ReplayState {
+                                provider: "fake".into(),
+                                model: None,
+                                format: "opaque".into(),
+                                version: 1,
+                                payload: serde_json::json!({"token":1}),
+                                required_for_replay: true,
+                            },
+                        },
+                    ],
+                },
+            ),
+            HistoryEntry::completed(
+                "result",
+                ConversationMessage::Tool {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    content: vec![ContentBlock::text("found")],
+                    is_error: false,
+                },
+            ),
+            HistoryEntry::completed("next", ConversationMessage::user("continue")),
+        ],
+    };
+    activity
+        .generate_with_progress(
+            GenerateInput {
+                model: "fake".into(),
+                history: history.clone(),
+                message_id: "response".into(),
+            },
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(model.requests.lock().unwrap()[0].history, history);
 }

@@ -137,3 +137,12 @@ fn close_is_not_permanent_and_round_trip_preserves_dedup() {
         s
     );
 }
+
+#[test]
+fn message_types_are_shared_with_messages_crate() {
+    let message: crate::ConversationMessage =
+        rusty_bot_messages::ConversationMessage::user("fixture");
+    let entry: crate::HistoryEntry = rusty_bot_messages::HistoryEntry::completed("id", message);
+    let status: crate::MessageStatus = rusty_bot_messages::MessageStatus::Completed;
+    assert_eq!(entry.status, status);
+}

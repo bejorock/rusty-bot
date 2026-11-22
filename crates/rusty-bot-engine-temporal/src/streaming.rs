@@ -1,22 +1,19 @@
-//! Batched cumulative drafts committed to the caller's shared session adapter.
+//! Validated batched canonical drafts committed to the shared session adapter.
 use super::*;
 use temporalio_client::{Client, WorkflowExecutionInfo, WorkflowHandle, WorkflowSignalOptions};
 
-/// Cumulative text, not a delta: repeated or out-of-order deliveries cannot duplicate text.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartialReply {
     pub turn_id: u64,
     pub sequence: u64,
     pub text: String,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivityInput {
     pub session_id: String,
     pub turn_id: u64,
     pub request: GenerateInput,
 }
-
 pub(super) struct ProgressTarget {
     pub client: Client,
     pub execution: WorkflowExecutionInfo,
@@ -26,74 +23,111 @@ pub(super) struct ProgressTarget {
     pub run_id: String,
 }
 
-impl ProgressTarget {
-    pub async fn forward(
-        self,
-        mut events: tokio::sync::mpsc::Receiver<rusty_bot_core::StreamEvent>,
-    ) -> Result<(), ModelError> {
-        let session = WorkflowHandle::<_, ChatSessionWorkflow>::new(self.client, self.execution);
-        let mut text = String::new();
-        let mut dirty = false;
-        let mut sequence = 0;
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            let (finished, flush) = tokio::select! {
-                event = events.recv() => match event {
-                    Some(rusty_bot_core::StreamEvent::TextDelta(delta)) => {
-                        text.push_str(&delta);
-                        dirty = true;
-                        (false, false)
+pub(super) async fn consume(
+    mut events: tokio::sync::mpsc::Receiver<MessageStreamEvent>,
+    message_id: String,
+    progress: Option<ProgressTarget>,
+) -> Result<MessageAccumulator, ModelError> {
+    let mut accumulator = MessageAccumulator::default();
+    let mut sequence = 0;
+    let mut dirty = false;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let (finished, flush) = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => {
+                    if event.message_id != message_id {
+                        return Err(protocol("stream message identity mismatch"));
                     }
-                    Some(_) => (false, false),
-                    None => (true, true),
-                },
-                _ = tick.tick() => (false, true),
-            };
-            // Batch at the interval boundary, or flush remaining text at completion.
-            if dirty && flush {
-                sequence += 1;
-                self.storage
-                    .change(
-                        &self.session_id,
-                        rusty_bot_session::SessionChange::Draft {
-                            run_id: self.run_id.clone(),
-                            turn_id: self.turn_id,
-                            sequence,
-                            text: text.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(|error| {
-                        ModelError::new(
-                            rusty_bot_core::ModelErrorKind::Network,
-                            error.to_string(),
-                            true,
+                    accumulator.apply(event).map_err(|e| protocol(&e.to_string()))?;
+                    dirty = true;
+                    (false, false)
+                }
+                None => (true, true),
+            },
+            _ = tick.tick() => (false, true),
+        };
+        if dirty && flush {
+            if let Some(target) = &progress {
+                // Never publish executable calls or opaque incomplete arguments in a draft.
+                let mut blocks: Vec<_> = accumulator
+                    .blocks()
+                    .iter()
+                    .filter(|b| {
+                        !matches!(
+                            b,
+                            ContentBlock::ToolCall { .. } | ContentBlock::InvalidToolCall { .. }
+                        ) && b.tool_call().is_none()
+                            && !matches!(b, ContentBlock::Annotated { block, .. } if matches!(block.as_ref(), ContentBlock::InvalidToolCall { .. }))
+                    })
+                    .cloned()
+                    .collect();
+                if let Some((kind, text)) = accumulator.partial() {
+                    match kind {
+                        BlockStart::Text => blocks.push(ContentBlock::Text { text: text.into() }),
+                        BlockStart::Reasoning => {
+                            blocks.push(ContentBlock::Reasoning { text: text.into() })
+                        }
+                        _ => {}
+                    }
+                }
+                if !blocks.is_empty() {
+                    let mut response = HistoryEntry::completed(
+                        &message_id,
+                        ConversationMessage::Assistant { content: blocks },
+                    );
+                    response.turn_id = Some(target.turn_id);
+                    response.status = MessageStatus::Generating;
+                    response.validate().map_err(|e| protocol(&e.to_string()))?;
+                    sequence += 1;
+                    let text = rusty_bot_session::visible_text(&response.message);
+                    target
+                        .storage
+                        .change(
+                            &target.session_id,
+                            SessionChange::DraftResponse {
+                                run_id: target.run_id.clone(),
+                                turn_id: target.turn_id,
+                                sequence,
+                                response: Box::new(response),
+                            },
                         )
-                    })?;
-                session
-                    .signal(
-                        ChatSessionWorkflow::partial_reply,
-                        PartialReply {
-                            turn_id: self.turn_id,
-                            sequence,
-                            text: text.clone(),
-                        },
-                        WorkflowSignalOptions::default(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        ModelError::new(
-                            rusty_bot_core::ModelErrorKind::Network,
-                            format!("partial reply signal failed: {error}"),
-                            false,
+                        .await
+                        .map_err(|e| {
+                            ModelError::new(ModelErrorKind::Network, e.to_string(), true)
+                        })?;
+                    let session = WorkflowHandle::<_, ChatSessionWorkflow>::new(
+                        target.client.clone(),
+                        target.execution.clone(),
+                    );
+                    session
+                        .signal(
+                            ChatSessionWorkflow::partial_reply,
+                            PartialReply {
+                                turn_id: target.turn_id,
+                                sequence,
+                                text,
+                            },
+                            WorkflowSignalOptions::default(),
                         )
-                    })?;
-                dirty = false;
+                        .await
+                        .map_err(|e| {
+                            ModelError::new(
+                                ModelErrorKind::Network,
+                                format!("partial reply signal failed: {e}"),
+                                false,
+                            )
+                        })?;
+                }
             }
-            if finished {
-                return Ok(());
-            }
+            dirty = false;
+        }
+        if finished {
+            return Ok(accumulator);
         }
     }
+}
+fn protocol(message: &str) -> ModelError {
+    ModelError::new(ModelErrorKind::Protocol, message.to_string(), false)
 }

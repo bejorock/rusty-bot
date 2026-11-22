@@ -6,3 +6,6 @@ target/
 
 # Local session journals contain source code and model output.
 .rusty-bot/
+
+# CLI-local test credentials; keep the placeholder template tracked.
+/crates/rusty-bot-cli/.env

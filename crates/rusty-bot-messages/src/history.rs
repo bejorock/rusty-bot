@@ -444,6 +444,20 @@ impl Default for ChatHistory {
     }
 }
 impl ChatHistory {
+    /// Prepare an exported transcript for use as a new session's initial history.
+    ///
+    /// Replaces every entry ID with `import:<index>` in transcript order, including
+    /// IDs that already use that prefix. All other fields, including turn IDs,
+    /// content blocks, replay state, and generation metadata, are unchanged.
+    /// This does not validate the history: initial context must still be complete
+    /// and valid, and a provider can reject content it cannot translate.
+    pub fn for_session_import(mut self) -> Self {
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            entry.id = format!("import:{index}");
+        }
+        self
+    }
+
     pub fn validate(&self) -> Result<(), HistoryError> {
         self.validate_inner(false)
     }

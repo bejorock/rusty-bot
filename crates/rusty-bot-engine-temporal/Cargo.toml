@@ -6,6 +6,7 @@ rust-version = "1.92"
 license.workspace = true
 
 [dependencies]
+rusty-bot-providers = { path = "../rusty-bot-providers" }
 rusty-bot-session = { path = "../rusty-bot-session" }
 uuid.workspace = true
 async-trait.workspace = true

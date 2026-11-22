@@ -26,15 +26,16 @@ pub struct EngineOptions {
 pub struct Engine {
     runtime: Runtime,
     client: Client,
-    provider: Arc<dyn ModelProvider>,
+    provider: Arc<dyn rusty_bot_providers::Provider>,
     storage: Arc<dyn SessionStorage>,
     options: EngineOptions,
     rollover: RolloverPolicy,
+    activity_timeout_ms: u64,
 }
 impl Engine {
     pub async fn connect(
         options: EngineOptions,
-        provider: Arc<dyn ModelProvider>,
+        provider: Arc<dyn rusty_bot_providers::Provider>,
         storage: Arc<dyn SessionStorage>,
     ) -> EngineResult<Self> {
         if options.namespace.trim().is_empty()
@@ -47,6 +48,19 @@ impl Engine {
                     .into(),
             );
         }
+        // A provider without an operation budget cannot be safely bounded by the Activity.
+        let budget = provider
+            .operation_timeout()
+            .ok_or("provider must declare an operation timeout")?;
+        if budget.is_zero() {
+            return Err("provider operation timeout must be positive".into());
+        }
+        let activity_timeout_ms: u64 = budget
+            .checked_add(Duration::from_secs(60))
+            .ok_or("provider timeout too large")?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "provider timeout too large")?;
         let connection =
             Connection::connect(ConnectionOptions::new(Url::parse(&options.address)?).build())
                 .await?;
@@ -61,6 +75,7 @@ impl Engine {
             storage,
             options,
             rollover: RolloverPolicy::default(),
+            activity_timeout_ms,
         })
     }
     /// Sets between-turn rollover thresholds for newly started executions.
@@ -101,36 +116,42 @@ impl Engine {
         self.start_session_with_history(id, model, ChatHistory::default())
             .await
     }
-    /// Stores immutable provider-neutral initial context. Provider translation is deferred:
-    /// nonempty initial history can be inspected, but text generation is explicitly refused.
+    /// Stores immutable provider-neutral initial context. Declared provider models must
+    /// match the session model. Callers must isolate differing providers and accounts by queue.
+    /// To copy an exported session transcript, explicitly call
+    /// [`ChatHistory::for_session_import`] first to rebase reserved turn entry IDs.
+    /// Supplied IDs are otherwise left unchanged.
     pub async fn start_session_with_history(
         &self,
         id: String,
         model: String,
         initial_history: ChatHistory,
     ) -> EngineResult<Session> {
-        initial_history.validate_complete()?;
+        validate_provider_model(self.provider.as_ref(), &model)?;
+        let config = SessionConfig {
+            id,
+            model,
+            namespace: self.options.namespace.clone(),
+            task_queue: self.options.task_queue.clone(),
+            idle_timeout_ms: self.options.idle_timeout.as_millis() as u64,
+            initial_history,
+        };
+        config.validate()?;
         let stored = self
             .storage
             .create(StoredSession::new(
-                SessionConfig {
-                    id,
-                    model,
-                    namespace: self.options.namespace.clone(),
-                    task_queue: self.options.task_queue.clone(),
-                    idle_timeout_ms: self.options.idle_timeout.as_millis() as u64,
-                    initial_history,
-                },
+                config,
                 format!("rusty-session-{}", uuid::Uuid::new_v4()),
             ))
             .await?;
         self.open(stored).await
     }
-    /// Reopens a known application session without requiring its model again.
+    /// Reopens a known session, checking a declared provider model against its stored label.
     pub async fn resume_session(&self, id: &str) -> EngineResult<Session> {
         self.open(self.storage.read(id).await?).await
     }
     async fn open(&self, stored: StoredSession) -> EngineResult<Session> {
+        validate_provider_model(self.provider.as_ref(), &stored.config.model)?;
         if stored.config.namespace != self.options.namespace
             || stored.config.task_queue != self.options.task_queue
         {
@@ -145,6 +166,7 @@ impl Engine {
                     idle_timeout_ms: stored.config.idle_timeout_ms,
                     rollover: self.rollover.clone(),
                     idle_deadline_ms: None,
+                    activity_timeout_ms: self.activity_timeout_ms,
                 },
                 WorkflowStartOptions::new(
                     self.options.task_queue.clone(),

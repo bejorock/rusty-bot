@@ -46,3 +46,63 @@ impl TestServer {
         }
     }
 }
+
+pub(super) async fn send_event(
+    events: &tokio::sync::mpsc::Sender<super::MessageStreamEvent>,
+    id: &str,
+    sequence: u64,
+    event: super::MessageStreamPayload,
+) {
+    events
+        .send(super::MessageStreamEvent {
+            message_id: id.into(),
+            sequence,
+            event,
+        })
+        .await
+        .unwrap();
+}
+/// Emit a contiguous canonical stream; the authoritative response may differ from its preview.
+pub(super) async fn emit_text(
+    events: &tokio::sync::mpsc::Sender<super::MessageStreamEvent>,
+    id: &str,
+    response: &super::HistoryEntry,
+    chunks: &[&str],
+) {
+    use super::{BlockStart, MessageStreamPayload as P};
+    send_event(events, id, 1, P::Start).await;
+    send_event(
+        events,
+        id,
+        2,
+        P::BlockStart {
+            index: 0,
+            block: BlockStart::Text,
+        },
+    )
+    .await;
+    let mut seq = 3;
+    for chunk in chunks {
+        send_event(
+            events,
+            id,
+            seq,
+            P::BlockDelta {
+                index: 0,
+                delta: (*chunk).into(),
+            },
+        )
+        .await;
+        seq += 1;
+    }
+    send_event(events, id, seq, P::BlockEnd { index: 0 }).await;
+    send_event(
+        events,
+        id,
+        seq + 1,
+        P::Completed {
+            response: Box::new(response.clone()),
+        },
+    )
+    .await;
+}

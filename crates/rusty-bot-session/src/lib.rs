@@ -1,29 +1,15 @@
 //! Shared session persistence contract. No Temporal, provider or database dependency.
 use async_trait::async_trait;
+pub use rusty_bot_messages::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
-mod history;
-pub use history::*;
-mod generation;
-pub use generation::*;
-mod message_stream;
-pub use message_stream::*;
-mod prompt;
-pub use prompt::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", content = "text", rename_all = "snake_case")]
 pub enum ChatMessage {
     User(String),
     Assistant(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MessageStatus {
-    Generating,
-    Completed,
-    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +79,8 @@ pub struct StoredTurn {
     /// Canonical assistant response. Legacy turns have no rich response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<HistoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_response: Option<HistoryEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +117,17 @@ impl StoredSession {
                 history.entries.push(response.clone());
                 continue;
             }
+            if let Some(draft) = &turn.draft_response {
+                if !matches!(turn.result, Some(Ok(_))) {
+                    let mut draft = draft.clone();
+                    if let Some(Err(error)) = &turn.result {
+                        draft.status = MessageStatus::Failed;
+                        draft.failure = Some(error.clone());
+                    }
+                    history.entries.push(draft);
+                    continue;
+                }
+            }
             let (text, status, failure) = match &turn.result {
                 Some(Ok(text)) => (text.clone(), MessageStatus::Completed, None),
                 Some(Err(error)) => (
@@ -151,6 +150,31 @@ impl StoredSession {
             });
         }
         history
+    }
+    /// Completed model context only; failed and unfinished turns are excluded.
+    pub fn generation_history(&self) -> Result<ChatHistory, HistoryError> {
+        let mut history = self.config.initial_history.clone();
+        for turn in &self.turns {
+            if let Some(Ok(reply)) = &turn.result {
+                let mut user = HistoryEntry::completed(
+                    format!("turn:{}:user", turn.id),
+                    ConversationMessage::user(turn.text.clone()),
+                );
+                user.turn_id = Some(turn.id);
+                history.entries.push(user);
+                let response = turn.response.clone().unwrap_or_else(|| {
+                    let mut response = HistoryEntry::completed(
+                        format!("turn:{}:assistant", turn.id),
+                        ConversationMessage::assistant(reply.clone()),
+                    );
+                    response.turn_id = Some(turn.id);
+                    response
+                });
+                history.entries.push(response);
+            }
+        }
+        history.validate_complete()?;
+        Ok(history)
     }
     pub fn snapshot(&self) -> SessionSnapshot {
         let mut messages = vec![];
@@ -235,7 +259,7 @@ impl StoredSession {
                 return Ok(());
             }
             _ if self.owner_run.as_deref() != Some(change.run_id()) => {
-                return Err(StorageError::Conflict("stale session owner".into()))
+                return Err(StorageError::Conflict("stale session owner".into()));
             }
             _ => {}
         }
@@ -269,6 +293,7 @@ impl StoredSession {
                     sequence: 0,
                     result: None,
                     response: None,
+                    draft_response: None,
                 });
             }
             SessionChange::Draft {
@@ -282,6 +307,40 @@ impl StoredSession {
                     turn.draft = text.clone();
                     turn.sequence = *sequence;
                 }
+            }
+            SessionChange::DraftResponse {
+                turn_id,
+                sequence,
+                response,
+                ..
+            } => {
+                if response.id != format!("turn:{turn_id}:assistant")
+                    || response.turn_id != Some(*turn_id)
+                    || response.status != MessageStatus::Generating
+                    || response.failure.is_some()
+                    || !matches!(response.message, ConversationMessage::Assistant { .. })
+                    || response
+                        .message
+                        .content()
+                        .iter()
+                        .any(|block| block.tool_call().is_some())
+                {
+                    return Err(StorageError::Conflict(
+                        "invalid canonical assistant draft".into(),
+                    ));
+                }
+                response
+                    .validate()
+                    .map_err(|e| StorageError::Conflict(e.to_string()))?;
+                let turn = self.turn_mut(*turn_id)?;
+                if turn.result.is_some() || *sequence <= turn.sequence {
+                    return Err(StorageError::Conflict(
+                        "stale or duplicate canonical draft".into(),
+                    ));
+                }
+                turn.draft = visible_text(&response.message);
+                turn.sequence = *sequence;
+                turn.draft_response = Some(*response.clone());
             }
             SessionChange::Finish {
                 turn_id, result, ..
@@ -332,7 +391,7 @@ impl StoredSession {
                         ));
                     }
                     // Snapshot is a legacy display view, never authoritative model context.
-                    turn.result = Some(Ok(response.message.text_only().unwrap_or_default()));
+                    turn.result = Some(Ok(visible_text(&response.message)));
                     turn.response = Some(*response.clone());
                 }
             }
@@ -370,6 +429,12 @@ pub enum SessionChange {
         sequence: u64,
         text: String,
     },
+    DraftResponse {
+        run_id: String,
+        turn_id: u64,
+        sequence: u64,
+        response: Box<HistoryEntry>,
+    },
     Finish {
         run_id: String,
         turn_id: u64,
@@ -390,11 +455,28 @@ impl SessionChange {
             Self::Claim { run_id }
             | Self::Begin { run_id, .. }
             | Self::Draft { run_id, .. }
+            | Self::DraftResponse { run_id, .. }
             | Self::Finish { run_id, .. }
             | Self::FinishResponse { run_id, .. }
             | Self::Close { run_id } => run_id,
         }
     }
+}
+
+/// Human-visible answer projection, not a model-context conversion.
+pub fn visible_text(message: &ConversationMessage) -> String {
+    fn render(block: &ContentBlock, out: &mut String) {
+        match block {
+            ContentBlock::Text { text } | ContentBlock::Refusal { text } => out.push_str(text),
+            ContentBlock::Annotated { block, .. } => render(block, out),
+            _ => {}
+        }
+    }
+    let mut result = String::new();
+    for block in message.content() {
+        render(block, &mut result);
+    }
+    result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -464,6 +546,115 @@ mod history_tests;
 #[cfg(test)]
 mod message_contract_tests;
 #[cfg(test)]
-mod prompt_tests;
-#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod canonical_generation_tests {
+    use super::*;
+
+    fn session() -> StoredSession {
+        let mut session = StoredSession::new(
+            SessionConfig {
+                id: "s".into(),
+                model: "label".into(),
+                namespace: "n".into(),
+                task_queue: "q".into(),
+                idle_timeout_ms: 1,
+                initial_history: ChatHistory {
+                    entries: vec![HistoryEntry::completed(
+                        "system",
+                        ConversationMessage::system("rules"),
+                    )],
+                    ..Default::default()
+                },
+            },
+            "workflow".into(),
+        );
+        session
+            .apply(&SessionChange::Claim { run_id: "r".into() })
+            .unwrap();
+        session
+    }
+    #[test]
+    fn rich_draft_survives_claim_but_is_excluded_from_generation() {
+        let mut s = session();
+        s.apply(&SessionChange::Begin {
+            run_id: "r".into(),
+            request_id: "one".into(),
+            text: "hello".into(),
+        })
+        .unwrap();
+        let mut draft = HistoryEntry::completed(
+            "turn:1:assistant",
+            ConversationMessage::Assistant {
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: "secret".into(),
+                    },
+                    ContentBlock::Refusal { text: "no".into() },
+                ],
+            },
+        );
+        draft.turn_id = Some(1);
+        draft.status = MessageStatus::Generating;
+        let change = SessionChange::DraftResponse {
+            run_id: "r".into(),
+            turn_id: 1,
+            sequence: 1,
+            response: Box::new(draft),
+        };
+        s.apply(&change).unwrap();
+        assert!(s.apply(&change).is_err());
+        assert_eq!(
+            s.snapshot().messages[1].message,
+            ChatMessage::Assistant("no".into())
+        );
+        s.apply(&SessionChange::Claim {
+            run_id: "new".into(),
+        })
+        .unwrap();
+        let history = s.history();
+        assert_eq!(history.entries[2].status, MessageStatus::Failed);
+        assert!(history.entries[2].failure.is_some());
+        assert!(matches!(
+            history.entries[2].message.content()[0],
+            ContentBlock::Reasoning { .. }
+        ));
+        assert_eq!(s.generation_history().unwrap().entries.len(), 1);
+    }
+    #[test]
+    fn completed_rich_response_projects_visible_text_but_preserves_context() {
+        let mut s = session();
+        s.apply(&SessionChange::Begin {
+            run_id: "r".into(),
+            request_id: "one".into(),
+            text: "hello".into(),
+        })
+        .unwrap();
+        let mut response = HistoryEntry::completed(
+            "turn:1:assistant",
+            ConversationMessage::Assistant {
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: "hidden".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ],
+            },
+        );
+        response.turn_id = Some(1);
+        s.apply(&SessionChange::FinishResponse {
+            run_id: "r".into(),
+            turn_id: 1,
+            response: Box::new(response.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            s.snapshot().messages[1].message,
+            ChatMessage::Assistant("answer".into())
+        );
+        assert_eq!(s.generation_history().unwrap().entries[2], response);
+    }
+}

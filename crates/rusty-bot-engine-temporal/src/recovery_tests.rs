@@ -20,7 +20,11 @@ impl SessionStorage for FaultStorage {
         self.inner.read(id).await
     }
     async fn change(&self, id: &str, change: SessionChange) -> StorageResult<StoredSession> {
-        if matches!(change, SessionChange::Finish { .. }) && !self.released.load(Ordering::SeqCst) {
+        if matches!(
+            change,
+            SessionChange::Finish { .. } | SessionChange::FinishResponse { .. }
+        ) && !self.released.load(Ordering::SeqCst)
+        {
             if self.after_write {
                 self.inner.change(id, change).await?;
             }
@@ -28,6 +32,84 @@ impl SessionStorage for FaultStorage {
             return Err(StorageError::Backend("controlled commit outage".into()));
         }
         self.inner.change(id, change).await
+    }
+}
+
+#[tokio::test]
+async fn fault_storage_intercepts_legacy_and_canonical_finishes_offline() {
+    for after_write in [false, true] {
+        for canonical in [false, true] {
+            let storage = FaultStorage {
+                inner: MemorySessionStorage::default(),
+                attempts: AtomicUsize::new(0),
+                released: AtomicBool::new(false),
+                after_write,
+            };
+            let config = rusty_bot_session::SessionConfig {
+                id: "session".into(),
+                model: "fake".into(),
+                namespace: "default".into(),
+                task_queue: "queue".into(),
+                idle_timeout_ms: 1_000,
+                initial_history: Default::default(),
+            };
+            storage
+                .create(StoredSession::new(config, "workflow".into()))
+                .await
+                .unwrap();
+            storage
+                .change(
+                    "session",
+                    SessionChange::Claim {
+                        run_id: "run".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            storage
+                .change(
+                    "session",
+                    SessionChange::Begin {
+                        run_id: "run".into(),
+                        request_id: "request".into(),
+                        text: "hello".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let finish = if canonical {
+                let mut response = HistoryEntry::completed(
+                    "turn:1:assistant",
+                    ConversationMessage::assistant("answer"),
+                );
+                response.turn_id = Some(1);
+                SessionChange::FinishResponse {
+                    run_id: "run".into(),
+                    turn_id: 1,
+                    response: Box::new(response),
+                }
+            } else {
+                SessionChange::Finish {
+                    run_id: "run".into(),
+                    turn_id: 1,
+                    result: Ok("answer".into()),
+                }
+            };
+            assert!(matches!(
+                storage.change("session", finish.clone()).await,
+                Err(StorageError::Backend(_))
+            ));
+            assert_eq!(storage.attempts.load(Ordering::SeqCst), 1);
+            let stored = storage.read("session").await.unwrap();
+            assert_eq!(stored.turns[0].result.is_some(), after_write);
+            assert_eq!(stored.turns[0].response.is_some(), after_write && canonical);
+            storage.released.store(true, Ordering::SeqCst);
+            storage.change("session", finish.clone()).await.unwrap();
+            storage.change("session", finish).await.unwrap();
+            let stored = storage.read("session").await.unwrap();
+            assert_eq!(stored.turns[0].result, Some(Ok("answer".into())));
+            assert_eq!(stored.turns[0].response.is_some(), canonical);
+        }
     }
 }
 
@@ -73,6 +155,7 @@ async fn commit_outage(after_write: bool) {
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         let stored = storage.read(session.id()).await.unwrap();
         assert_eq!(stored.turns[0].result.is_some(), after_write);
+        assert_eq!(stored.turns[0].response.is_some(), after_write);
     }).await.unwrap();
     // Rebuild the worker with no Workflow cache while final persistence is pending.
     let fresh = Engine::connect(options, model.clone(), storage.clone())
@@ -92,6 +175,11 @@ async fn commit_outage(after_write: bool) {
                 TurnResult::Completed(_)
             ));
             assert_eq!(model.requests.lock().unwrap().len(), 1);
+            assert!(
+                storage.read(session.id()).await.unwrap().turns[0]
+                    .response
+                    .is_some()
+            );
             assert_eq!(resumed.snapshot().await.unwrap().messages.len(), 2);
             assert_eq!(
                 resumed.send_message("again".into()).await.unwrap(),

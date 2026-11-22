@@ -1,5 +1,11 @@
 # rusty-bot-session
 
+Session identity, lifecycle, and storage contracts. Provider-neutral messages,
+history, generation metadata, stream events, and prompt templates now live in
+`rusty-bot-messages` and are re-exported here for compatibility. Applications that
+only need LLM messages should depend on that crate (or the messages re-export in
+`rusty-bot-providers`), not session persistence.
+
 SDK-owned application session contract, independent of Temporal and PostgreSQL.
 
 The host injects `Arc<dyn SessionStorage>` into the Temporal engine. Implementations provide atomic `create`, `read` and `change` operations. `StoredSession::apply` defines the shared transitions for run ownership, request deduplication, ordered drafts, final results and graceful closure. Adapters must serialize changes to a session and persist the entire validated transition or nothing.
@@ -20,13 +26,13 @@ Blocks support text, image, audio, video, file, JSON, displayable reasoning, too
 
 Media uses `MediaSource::Inline` (MIME type/base64), `Url`, or an application-managed `Reference`. The schema does not fetch URLs, open files, decode media or enforce provider capabilities. Treat URLs/references as untrusted application data. `validate()` checks transcript structure and tool identities; `validate_complete()` also requires completed entries and no outstanding tool calls. Neither proves a provider can accept the content.
 
-`SessionConfig::initial_history` stores immutable, rendered initial context. Its default is empty, including when reading older stored JSON. Initial entry IDs cannot use the reserved `turn:` prefix. `StoredSession::history()` appends turns with deterministic `turn:<id>:user/assistant` IDs, draft/failure status and failure details. `SessionChange::FinishResponse` can atomically commit a complete canonical assistant `HistoryEntry`, preserving blocks and generation metadata; identical retries are idempotent and conflicting overwrites are rejected. Legacy text results remain readable. The existing `snapshot()` remains a legacy text-only view. This increment does **not** translate rich messages into provider requests or enable multimodal/tool execution.
+`SessionConfig::initial_history` stores immutable, rendered initial context. Its default is empty, including when reading older stored JSON. Initial entry IDs cannot use the reserved `turn:` prefix. `StoredSession::history()` appends turns with deterministic `turn:<id>:user/assistant` IDs, draft/failure status and failure details. To use an exported history as initial context for a **new** session, call `history.for_session_import()` explicitly: it replaces every entry ID in order with `import:<index>`, preserving turn IDs and all other entry data, including blocks, replay and generation metadata. The original IDs are not retained; clone the history first if needed. This does not validate the history: initial context must still contain only completed entries with no unresolved tool calls, and the target provider may reject unsupported content. This copies context into a new session; it does not change the model of an existing session. Without this explicit call supplied IDs remain unchanged. `SessionChange::FinishResponse` can atomically commit a complete canonical assistant `HistoryEntry`, preserving blocks and generation metadata; identical retries are idempotent and conflicting overwrites are rejected. Legacy text results remain readable. The existing `snapshot()` remains a legacy text display. The Temporal Activity forwards canonical history to its injected provider; supported content depends on the provider adapter, and the engine does not execute tools.
 
 ## Stream contract
 
 `MessageStreamEvent` is transport-independent: it defines message start, ordered block start/delta/end, completion and failure. Events carry a stable message ID and contiguous sequence number. `MessageAccumulator` rejects invalid ordering/identity without changing its state. Raw partial tool-argument JSON is preview data, never an executable call; a malformed finished call becomes `InvalidToolCall`. A final completed `HistoryEntry` is authoritative, even when its content differs from the preview.
 
-This is a contract and accumulator, **not a new live transport**. The current Temporal model Activity still streams legacy text drafts and commits text results. Provider translation, rich-response capture and tool execution are deferred; the Temporal admission guard refuses rich history rather than feeding a lossy projection to that model path.
+The Temporal model Activity consumes these provider events, persists batched canonical drafts and commits the authoritative rich final response. Incomplete tool arguments and executable calls are not published as drafts. The stream contract is not itself a client-facing live transport: text partial Signals maintain the Workflow view, while `history()` reads persisted rich data. Providers explicitly reject unsupported translations; Temporal does not execute tool calls.
 
 ## Reusable prompts
 

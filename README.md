@@ -2,7 +2,17 @@
 
 An embeddable AI coding-agent SDK for Rust. Connect a model to a workspace and let the SDK handle model requests, tools, session history, and progress updates.
 
-This project provides libraries, not a CLI or web application.
+## Standalone LLM libraries
+
+- [`rusty-bot-messages`](crates/rusty-bot-messages/README.md): provider-neutral
+  messages, multimodal history, stream events, and prompt templates; no runtime or storage dependency.
+- [`rusty-bot-providers`](crates/rusty-bot-providers/README.md): Tokio-based OpenAI,
+  Anthropic, and DeepSeek adapters, usable without the agent engine or Temporal.
+
+These libraries are being prepared for separate publication. See [PUBLISHING.md](PUBLISHING.md)
+for package verification and the release checklist. The Temporal engine and test CLI
+are documented in their own crate READMEs. The local agent SDK below remains available
+for compatibility and migration reference.
 
 ## Requirements
 

@@ -201,3 +201,27 @@ fn legacy_turn_rejects_mismatched_duplicate_fields() {
         ModelErrorKind::Protocol
     );
 }
+
+#[test]
+fn provider_utility_types_are_shared_with_legacy_core() {
+    let error: crate::ModelError = rusty_bot_providers::ModelError::cancelled();
+    assert_eq!(error.kind, rusty_bot_providers::ModelErrorKind::Cancelled);
+    let limits: crate::ImageLimits = rusty_bot_providers::ImageLimits {
+        max_bytes: 10,
+        max_width: 2,
+        max_height: 3,
+    };
+    assert_eq!(
+        format!("{limits:?}"),
+        "ImageLimits { max_bytes: 10, max_width: 2, max_height: 3 }"
+    );
+    let _: crate::ToolSpec = rusty_bot_providers::ToolSpec {
+        name: "tool".into(),
+        description: "desc".into(),
+        parameters: serde_json::json!({}),
+    };
+    let _: crate::ProviderCredential = rusty_bot_providers::ProviderCredential::new("fixture");
+    let _: &dyn crate::CredentialResolver = &rusty_bot_providers::StaticCredentialResolver::new(
+        rusty_bot_providers::ProviderCredential::new("fixture"),
+    );
+}

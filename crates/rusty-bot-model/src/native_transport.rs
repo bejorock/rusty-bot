@@ -37,37 +37,13 @@ pub(crate) async fn apply_payload_hook(
 }
 
 use base64::{engine::general_purpose, Engine as _};
-use rusty_bot_core::{
-    CredentialRequest, CredentialResolver, ModelError, ModelErrorKind, ProviderCredential,
-};
+#[cfg(test)]
+use rusty_bot_core::ProviderCredential;
+use rusty_bot_core::{CredentialRequest, CredentialResolver, ModelError, ModelErrorKind};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-/// Static credential convenience for callers that do not require refresh.
-pub struct StaticCredentialResolver(ProviderCredential);
-
-impl StaticCredentialResolver {
-    pub fn new(credential: ProviderCredential) -> Self {
-        Self(credential)
-    }
-}
-
-impl std::fmt::Debug for StaticCredentialResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("StaticCredentialResolver([REDACTED])")
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialResolver for StaticCredentialResolver {
-    async fn resolve(
-        &self,
-        _: &CredentialRequest,
-        _: CancellationToken,
-    ) -> Result<Option<ProviderCredential>, ModelError> {
-        Ok(Some(self.0.clone()))
-    }
-}
+pub use rusty_bot_providers::StaticCredentialResolver;
 
 /// Transport for native bearer-authenticated APIs. No custom headers or
 /// redirects are permitted. An HTTP endpoint is accepted only on loopback.

@@ -1,0 +1,31 @@
+[package]
+name = "rusty-bot-providers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.98"
+description = "Unified streaming LLM providers for OpenAI, Anthropic, and DeepSeek"
+readme = "README.md"
+documentation = "https://docs.rs/rusty-bot-providers"
+keywords = ["llm", "openai", "anthropic", "deepseek", "streaming"]
+categories = ["api-bindings", "asynchronous"]
+include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+httpdate = "1"
+tiktoken-rs = "0.12.1"
+jsonschema = { version = "0.26", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rusty-bot-messages = { path = "../rusty-bot-messages", version = "0.1.0" }
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+url = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
